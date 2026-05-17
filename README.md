@@ -84,28 +84,28 @@ playwright install chromium
 
 ```bash
 # Basic scan
-python recon.py -u example.com
+python Argos.py -u example.com
 
 # Fast scan with HTML report
-python recon.py -u example.com --speed 2000 --html
+python Argos.py -u example.com --speed 2000 --html
 
 # Stealth scan
-python recon.py -u example.com --speed 100
+python Argos.py -u example.com --speed 100
 
 # With GitHub dorking
-python recon.py -u example.com --github-token ghp_yourtoken
+python Argos.py -u example.com --github-token ghp_yourtoken
 
 # With screenshot
-python recon.py -u example.com --screenshot
+python Argos.py -u example.com --screenshot
 
 # With Nuclei
-python recon.py -u example.com --nuclei-path /usr/local/bin/nuclei
+python Argos.py -u example.com --nuclei-path /usr/local/bin/nuclei
 
 # Multiple targets from file
-python recon.py -f targets.txt --speed 1000 --html
+python Argos.py -f targets.txt --speed 1000 --html
 
 # Full options
-python recon.py -u example.com \
+python Argos.py -u example.com \
   --speed 1000 \
   --html \
   --github-token ghp_xxx \
