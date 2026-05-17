@@ -55,7 +55,7 @@ A fast, modular, async-powered web reconnaissance framework built for bug bounty
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/YOURUSERNAME/recon-v11
+git clone https://github.com/FortisFortuna-br/Argos-Recon
 cd recon-v11
 pip install -r requirements.txt
 ```
