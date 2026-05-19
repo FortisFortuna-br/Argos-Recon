@@ -221,6 +221,7 @@ class Config:
     github_token: Optional[str] = None
     nuclei_path: str = "nuclei"
     screenshot_enabled: bool = False
+    hackerone_username: Optional[str] = None
     user_agents: List[str] = field(default_factory=lambda: [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
@@ -260,6 +261,7 @@ class Config:
             github_token=self.github_token,
             nuclei_path=self.nuclei_path,
             screenshot_enabled=self.screenshot_enabled,
+            hackerone_username=self.hackerone_username,
             user_agents=self.user_agents.copy(),
         )
 
@@ -720,6 +722,8 @@ class AsyncHTTPClient:
     def _build_headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         headers: Dict[str, str] = {"User-Agent": get_random_ua(self.config)}
         headers.update(get_waf_bypass_headers())
+        if self.config.hackerone_username:
+            headers["X-Hackerone"] = self.config.hackerone_username
         if extra:
             headers.update(extra)
         return headers
@@ -3071,6 +3075,7 @@ async def async_main(args: argparse.Namespace) -> None:
     config.github_token = getattr(args, 'github_token', None)
     config.nuclei_path = getattr(args, 'nuclei_path', 'nuclei')
     config.screenshot_enabled = getattr(args, 'screenshot', False)
+    config.hackerone_username = getattr(args, 'hackerone_username', None)
 
     if args.concurrent:
         config.max_concurrent = args.concurrent
@@ -3087,7 +3092,8 @@ async def async_main(args: argparse.Namespace) -> None:
         f"ssl_verify={config.verify_ssl}, "
         f"github_token={'✓' if config.github_token else '✗'}, "
         f"nuclei={'✓' if NucleiScanner.is_available(config.nuclei_path) else '✗ (not installed)'}, "
-        f"screenshot={'✓' if config.screenshot_enabled else '✗'}[/dim]\n"
+        f"screenshot={'✓' if config.screenshot_enabled else '✗'}, "
+        f"h1_user={'✓ ' + config.hackerone_username if config.hackerone_username else '✗'}[/dim]\n"
     )
 
     targets: List[str] = []
@@ -3138,7 +3144,7 @@ async def async_main(args: argparse.Namespace) -> None:
 
             if args.html:
                 html_path = output_dir / f"{domain}_{timestamp}_speed{speed}.html"
-                html_path.write_text(ReportGenerator.generate_html(result))
+                html_path.write_text(ReportGenerator.generate_html(result), encoding="utf-8")
                 console.print(f"[green]HTML report saved: {html_path}[/green]")
 
             if not args.quiet:
@@ -3205,6 +3211,8 @@ Usage Examples:
                         help="Path to nuclei binary (default: nuclei)")
     parser.add_argument("--screenshot", action="store_true",
                         help="Capture screenshot with Playwright (requires: pip install playwright && playwright install chromium)")
+    parser.add_argument("--h1-user", dest="hackerone_username", default=None,
+                        help="HackerOne username for X-Hackerone header (required by some programs like Dyson)")
 
     args = parser.parse_args()
 
