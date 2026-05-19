@@ -101,6 +101,9 @@ python Argos.py -u example.com --screenshot
 # With Nuclei
 python Argos.py -u example.com --nuclei-path /usr/local/bin/nuclei
 
+# With User Flag
+python Argos.py -u example.com --speed 500 --html --h1-user (Your Flag username)
+
 # Multiple targets from file
 python Argos.py -f targets.txt --speed 1000 --html
 
