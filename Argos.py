@@ -222,6 +222,8 @@ class Config:
     nuclei_path: str = "nuclei"
     screenshot_enabled: bool = False
     hackerone_username: Optional[str] = None
+    proxy: Optional[str] = None
+    min_severity: Optional[str] = None  # HIGH, CRITICAL, MEDIUM, LOW
     user_agents: List[str] = field(default_factory=lambda: [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
@@ -262,6 +264,8 @@ class Config:
             nuclei_path=self.nuclei_path,
             screenshot_enabled=self.screenshot_enabled,
             hackerone_username=self.hackerone_username,
+            proxy=self.proxy,
+            min_severity=self.min_severity,
             user_agents=self.user_agents.copy(),
         )
 
@@ -706,13 +710,17 @@ class AsyncHTTPClient:
         self._waf_backoff: float = 0.0
 
     async def __aenter__(self) -> 'AsyncHTTPClient':
-        self.client = httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(self.config.timeout),
-            verify=self.config.verify_ssl,
-            limits=httpx.Limits(max_connections=self.config.max_concurrent * 2),
-            http2=True,
-        )
+        client_kwargs: Dict[str, Any] = {
+            "follow_redirects": True,
+            "timeout": httpx.Timeout(self.config.timeout),
+            "verify": self.config.verify_ssl,
+            "limits": httpx.Limits(max_connections=self.config.max_concurrent * 2),
+            "http2": True,
+        }
+        if self.config.proxy:
+            client_kwargs["proxy"] = self.config.proxy
+            logger.info(f"Using proxy: {self.config.proxy}")
+        self.client = httpx.AsyncClient(**client_kwargs)
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -1974,6 +1982,245 @@ class GitHubDorker:
                 logger.debug(f"GitHub dork error for query '{query}': {e}")
 
         return results, findings
+
+
+# =============================================================================
+# NEW MODULE: GITLAB & BITBUCKET DORKING
+# =============================================================================
+
+class GitLabBitbucketDorker:
+    """
+    GitLab ve Bitbucket'ta domain ile ilgili credential sızıntısı arar.
+    GitHub dorking'e ek olarak çalışır — üçlü platform taraması.
+    """
+
+    GITLAB_QUERIES = [
+        '"{domain}" password',
+        '"{domain}" secret',
+        '"{domain}" api_key',
+        '"{domain}" .env',
+        '"{domain}" token',
+    ]
+
+    @staticmethod
+    async def search_gitlab(
+        client: AsyncHTTPClient,
+        domain: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Finding]]:
+        results: List[Dict[str, Any]] = []
+        findings: List[Finding] = []
+
+        for query_template in GitLabBitbucketDorker.GITLAB_QUERIES[:3]:
+            query = query_template.replace("{domain}", domain)
+            try:
+                # GitLab public search endpoint
+                url = f"https://gitlab.com/search?scope=blobs&search={query.replace(' ', '+')}"
+                response = await client.get(url)
+                if not response or response.status_code not in [200, 302]:
+                    continue
+
+                # HTML'den sonuç çıkar
+                content = response.text
+                # GitLab blob result pattern
+                matches = re.findall(
+                    r'href="(/[^"]+/blob/[^"]+)"',
+                    content
+                )
+                for match in matches[:3]:
+                    full_url = f"https://gitlab.com{match}"
+                    repo_parts = match.split("/")
+                    repo_name = "/".join(repo_parts[1:3]) if len(repo_parts) >= 3 else match
+                    file_path = "/".join(repo_parts[5:]) if len(repo_parts) >= 5 else match
+
+                    is_critical = any(kw in file_path.lower() for kw in
+                                      [".env", "config", "secret", "password", "credential",
+                                       "private_key", "id_rsa"])
+                    severity = "HIGH" if is_critical else "MEDIUM"
+
+                    results.append({
+                        "platform": "GitLab",
+                        "query": query,
+                        "repository": repo_name,
+                        "file": file_path,
+                        "url": full_url,
+                    })
+                    findings.append(Finding(
+                        category="GitLab Dorking",
+                        severity=severity,
+                        title=f"Potential Leak on GitLab: {repo_name}",
+                        description=f"Query '{query}' found match in {file_path}",
+                        evidence=full_url,
+                        remediation="Review the file immediately and rotate any exposed credentials."
+                    ))
+
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                logger.debug(f"GitLab dork error for query '{query}': {e}")
+
+        return results, findings
+
+    @staticmethod
+    async def search_bitbucket(
+        client: AsyncHTTPClient,
+        domain: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Finding]]:
+        results: List[Dict[str, Any]] = []
+        findings: List[Finding] = []
+
+        try:
+            # Bitbucket public code search API
+            url = f"https://api.bitbucket.org/2.0/search/code?q={domain}&pagelen=5"
+            response = await client.get(url)
+            if response and response.status_code == 200:
+                try:
+                    data = response.json()
+                    for item in data.get("values", [])[:3]:
+                        file_obj = item.get("file", {})
+                        repo_name = file_obj.get("commit", {}).get("repository", {}).get("full_name", "")
+                        file_path = file_obj.get("path", "")
+                        repo_link = file_obj.get("links", {}).get("html", {}).get("href", "")
+
+                        if not repo_name:
+                            continue
+
+                        is_critical = any(kw in file_path.lower() for kw in
+                                          [".env", "config", "secret", "password", "credential"])
+                        severity = "HIGH" if is_critical else "MEDIUM"
+
+                        results.append({
+                            "platform": "Bitbucket",
+                            "repository": repo_name,
+                            "file": file_path,
+                            "url": repo_link,
+                        })
+                        findings.append(Finding(
+                            category="Bitbucket Dorking",
+                            severity=severity,
+                            title=f"Potential Leak on Bitbucket: {repo_name}",
+                            description=f"Domain '{domain}' found in {file_path}",
+                            evidence=repo_link,
+                            remediation="Review the file immediately and rotate any exposed credentials."
+                        ))
+                except Exception as e:
+                    logger.debug(f"Bitbucket response parse error: {e}")
+        except Exception as e:
+            logger.debug(f"Bitbucket dork error: {e}")
+
+        return results, findings
+
+
+# =============================================================================
+# NEW MODULE: CLOUD PROVIDER DETECTION
+# =============================================================================
+
+class CloudProviderDetector:
+    """
+    Hedef IP ve response header'larından cloud provider'ı tespit eder.
+    AWS/GCP/Azure/Cloudflare/DigitalOcean vb.
+    Bug bounty'de hedefin altyapısını anlamak için kritik bilgi.
+    """
+
+    CLOUD_HEADER_SIGNATURES: Dict[str, List[str]] = {
+        "AWS": ["x-amz-request-id", "x-amz-id-2", "x-amzn-requestid", "x-amz-cf-id"],
+        "GCP": ["x-goog-request-id", "x-cloud-trace-context", "server: gws"],
+        "Azure": ["x-ms-request-id", "x-ms-version", "x-azure-ref"],
+        "Cloudflare": ["cf-ray", "cf-cache-status", "server: cloudflare"],
+        "Fastly": ["x-fastly-request-id", "x-served-by"],
+        "Vercel": ["x-vercel-id", "x-vercel-cache"],
+        "Netlify": ["x-nf-request-id"],
+        "Akamai": ["x-akamai-request-id", "x-check-cacheable"],
+    }
+
+    CLOUD_BODY_SIGNATURES: Dict[str, List[str]] = {
+        "AWS": ["s3.amazonaws.com", "cloudfront.net", "amazonaws.com"],
+        "GCP": ["googleapis.com", "googleusercontent.com", "firebaseio.com"],
+        "Azure": ["azurewebsites.net", "windows.net", "azure.com"],
+        "Firebase": ["firebasestorage.googleapis.com", "firebaseio.com"],
+        "Supabase": [".supabase.co"],
+    }
+
+    ORG_TO_PROVIDER: Dict[str, str] = {
+        "amazon": "AWS",
+        "aws": "AWS",
+        "google": "GCP",
+        "microsoft": "Azure",
+        "cloudflare": "Cloudflare",
+        "digitalocean": "DigitalOcean",
+        "fastly": "Fastly",
+        "akamai": "Akamai",
+        "hetzner": "Hetzner",
+        "ovh": "OVH",
+        "linode": "Linode/Akamai",
+        "vultr": "Vultr",
+    }
+
+    @staticmethod
+    async def detect(
+        client: AsyncHTTPClient,
+        domain: str,
+        response_headers: Optional[httpx.Headers] = None,
+        body: str = "",
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "provider": "Unknown",
+            "confidence": "LOW",
+            "indicators": [],
+            "ip": "",
+            "org": "",
+            "country": "",
+            "city": "",
+            "asn": "",
+        }
+
+        headers_str = str(response_headers).lower() if response_headers else ""
+        body_lower = body.lower()
+
+        # 1. Header analizi
+        provider_scores: Dict[str, int] = defaultdict(int)
+        for provider, sigs in CloudProviderDetector.CLOUD_HEADER_SIGNATURES.items():
+            for sig in sigs:
+                if sig.lower() in headers_str:
+                    provider_scores[provider] += 2
+                    result["indicators"].append(f"Header: {sig}")
+
+        # 2. Body analizi
+        for provider, sigs in CloudProviderDetector.CLOUD_BODY_SIGNATURES.items():
+            for sig in sigs:
+                if sig.lower() in body_lower:
+                    provider_scores[provider] += 1
+                    result["indicators"].append(f"Body: {sig}")
+
+        # 3. IP/ASN analizi via ipinfo.io
+        try:
+            loop = asyncio.get_running_loop()
+            ip = await loop.run_in_executor(None, socket.gethostbyname, domain)
+            result["ip"] = ip
+
+            ip_resp = await client.get(f"https://ipinfo.io/{ip}/json")
+            if ip_resp and ip_resp.status_code == 200:
+                ip_data = ip_resp.json()
+                org = ip_data.get("org", "")
+                result["org"] = org
+                result["country"] = ip_data.get("country", "")
+                result["city"] = ip_data.get("city", "")
+                result["asn"] = org.split(" ")[0] if org else ""
+
+                org_lower = org.lower()
+                for keyword, provider in CloudProviderDetector.ORG_TO_PROVIDER.items():
+                    if keyword in org_lower:
+                        provider_scores[provider] += 3
+                        result["indicators"].append(f"ASN Org: {org}")
+                        break
+        except Exception as e:
+            logger.debug(f"Cloud IP detection error: {e}")
+
+        # En yüksek skoru olan provider'ı seç
+        if provider_scores:
+            best_provider, best_score = max(provider_scores.items(), key=lambda x: x[1])
+            result["provider"] = best_provider
+            result["confidence"] = "HIGH" if best_score >= 3 else "MEDIUM" if best_score >= 2 else "LOW"
+
+        return result
 
 
 # =============================================================================
