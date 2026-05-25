@@ -4,5 +4,4 @@ rich>=13.0.0
 aiodns>=3.0.0
 lxml==6.1.0
 packaging>=23.0
-
 h11==0.16.0
