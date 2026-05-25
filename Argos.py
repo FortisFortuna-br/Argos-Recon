@@ -3112,6 +3112,12 @@ class ReportGenerator:
 
     @staticmethod
     def generate_html(result: ReconResult) -> str:
+        import html as _html
+
+        def _e(v: Any) -> str:
+            """HTML-escape any value to prevent XSS in reports."""
+            return _html.escape(str(v) if v is not None else "")
+
         findings_html = ""
         for f in result.findings:
             severity_color = {
@@ -3120,18 +3126,18 @@ class ReportGenerator:
             }.get(f.get("severity", "INFO"), "#6c757d")
             findings_html += f"""
             <div class="finding" style="border-left: 4px solid {severity_color}; padding: 10px; margin: 10px 0; background: #f8f9fa;">
-                <strong style="color: {severity_color};">[{f.get('severity', 'INFO')}]</strong>
-                <strong>{f.get('title', 'Unknown')}</strong>
-                <p>{f.get('description', '')}</p>
-                {f'<code>{f.get("evidence", "")}</code>' if f.get('evidence') else ''}
-                {f'<p><em>Remediation: {f.get("remediation", "")}</em></p>' if f.get('remediation') else ''}
+                <strong style="color: {severity_color};">[{_e(f.get('severity', 'INFO'))}]</strong>
+                <strong>{_e(f.get('title', 'Unknown'))}</strong>
+                <p>{_e(f.get('description', ''))}</p>
+                {f'<code>{_e(f.get("evidence", ""))}</code>' if f.get('evidence') else ''}
+                {f'<p><em>Remediation: {_e(f.get("remediation", ""))}</em></p>' if f.get('remediation') else ''}
             </div>"""
 
         cve_html = ""
         for hint in result.cve_hints:
             cve_html += f"""
             <div style="border-left: 4px solid #e74c3c; padding: 8px; margin: 6px 0; background: #fdf2f2;">
-                <strong>[{hint.get('tech','').upper()}]</strong> {hint.get('cve','')} — {hint.get('description','')}
+                <strong>[{_e(hint.get('tech','').upper())}]</strong> {_e(hint.get('cve',''))} — {_e(hint.get('description',''))}
             </div>"""
 
         s3_html = ""
@@ -3139,18 +3145,18 @@ class ReportGenerator:
             color = "#dc3545" if s3.get("severity") == "CRITICAL" else "#ffc107"
             s3_html += f"""
             <div style="border-left: 4px solid {color}; padding: 8px; margin: 6px 0; background: #fdf2f2;">
-                <strong>{s3.get('bucket','')}</strong> — {s3.get('status','')}
-                <br><code>{s3.get('url','')}</code>
-                {f"<br>Files: <code>{', '.join(s3.get('files_preview', [])[:5])}</code>" if s3.get('files_preview') else ''}
+                <strong>{_e(s3.get('bucket',''))}</strong> — {_e(s3.get('status',''))}
+                <br><code>{_e(s3.get('url',''))}</code>
+                {f"<br>Files: <code>{_e(', '.join(s3.get('files_preview', [])[:5]))}</code>" if s3.get('files_preview') else ''}
             </div>"""
 
         github_html = ""
         for gh in result.github_dork_findings:
             github_html += f"""
             <div style="border-left: 4px solid #fd7e14; padding: 8px; margin: 6px 0; background: #fff8f0;">
-                <strong>{gh.get('repository','')}</strong> / <code>{gh.get('file','')}</code>
-                <br><small>Query: {gh.get('query','')}</small>
-                <br><a href="{gh.get('url','')}" target="_blank">{gh.get('url','')}</a>
+                <strong>{_e(gh.get('repository',''))}</strong> / <code>{_e(gh.get('file',''))}</code>
+                <br><small>Query: {_e(gh.get('query',''))}</small>
+                <br><a href="{_e(gh.get('url',''))}" target="_blank" rel="noopener noreferrer">{_e(gh.get('url',''))}</a>
             </div>"""
 
         nuclei_html = ""
@@ -3159,11 +3165,11 @@ class ReportGenerator:
                      "LOW": "#28a745", "INFO": "#17a2b8"}.get(nf.get("severity", "INFO"), "#6c757d")
             nuclei_html += f"""
             <div style="border-left: 4px solid {color}; padding: 8px; margin: 6px 0; background: #f8f9fa;">
-                <strong style="color:{color}">[{nf.get('severity','')}]</strong>
-                <strong>{nf.get('name','')}</strong>
-                {f"<span style='color:#888'> [{nf.get('cve','')}]</span>" if nf.get('cve') else ''}
-                <br><code>{nf.get('matched_at','')}</code>
-                <p>{nf.get('description','')}</p>
+                <strong style="color:{color}">[{_e(nf.get('severity',''))}]</strong>
+                <strong>{_e(nf.get('name',''))}</strong>
+                {f"<span style='color:#888'> [{_e(nf.get('cve',''))}]</span>" if nf.get('cve') else ''}
+                <br><code>{_e(nf.get('matched_at',''))}</code>
+                <p>{_e(nf.get('description',''))}</p>
             </div>"""
 
         exec_summary = result.executive_summary
@@ -3181,7 +3187,7 @@ class ReportGenerator:
         html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Recon Report V11 - {result.target}</title>
+    <title>Recon Report V11 - {_e(result.target)}</title>
     <meta charset="utf-8">
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }}
@@ -3209,11 +3215,11 @@ class ReportGenerator:
 <div class="container">
     <h1>🔍 Reconnaissance Report V11</h1>
     <div class="meta">
-        <strong>Target:</strong> {result.target}<br>
-        <strong>Timestamp:</strong> {result.timestamp}<br>
-        <strong>Speed Used:</strong> {result.speed_used}<br>
-        <strong>Overall Severity:</strong> <span class="severity severity-{result.severity_score}">{result.severity_score}</span>
-        &nbsp;<span class="score-badge">Risk Score: {exec_summary.get('risk_score', 0)}</span>
+        <strong>Target:</strong> {_e(result.target)}<br>
+        <strong>Timestamp:</strong> {_e(result.timestamp)}<br>
+        <strong>Speed Used:</strong> {_e(result.speed_used)}<br>
+        <strong>Overall Severity:</strong> <span class="severity severity-{_e(result.severity_score)}">{_e(result.severity_score)}</span>
+        &nbsp;<span class="score-badge">Risk Score: {_e(exec_summary.get('risk_score', 0))}</span>
     </div>
 
     {screenshot_html}
