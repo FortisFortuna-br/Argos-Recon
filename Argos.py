@@ -22,6 +22,9 @@ import logging
 import sys
 import subprocess
 import shutil
+import difflib
+import pickle
+import hashlib
 from datetime import datetime
 from collections import defaultdict
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -33,7 +36,10 @@ from contextlib import asynccontextmanager
 
 # Windows asyncio fix - must be before any asyncio usage
 if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except AttributeError:
+        pass  # Python 3.12+ deprecated this, safe to ignore
 
 try:
     from bs4 import BeautifulSoup
@@ -224,6 +230,8 @@ class Config:
     hackerone_username: Optional[str] = None
     proxy: Optional[str] = None
     min_severity: Optional[str] = None  # HIGH, CRITICAL, MEDIUM, LOW
+    resume_file: Optional[str] = None   # path for resume state
+    only_high: bool = False             # --only-high flag: show only HIGH+CRITICAL
     user_agents: List[str] = field(default_factory=lambda: [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15",
@@ -266,6 +274,8 @@ class Config:
             hackerone_username=self.hackerone_username,
             proxy=self.proxy,
             min_severity=self.min_severity,
+            resume_file=self.resume_file,
+            only_high=self.only_high,
             user_agents=self.user_agents.copy(),
         )
 
@@ -319,6 +329,7 @@ class ReconResult:
     nuclei_findings: List[Dict[str, Any]] = field(default_factory=list)
     discovered_parameters: List[str] = field(default_factory=list)
     screenshot_path: Optional[str] = None
+    scan_checkpoint: Optional[str] = None  # last completed step name (for resume)
 
 # =============================================================================
 # PATTERNS & SIGNATURES
@@ -438,38 +449,71 @@ FINGERPRINTS: Dict[str, List[Tuple[str, int]]] = {
 
 CVE_HINTS: Dict[str, List[Dict[str, str]]] = {
     "wordpress": [
-        {"cve": "CVE-2023-5561", "desc": "WordPress < 6.4.2: Privilege escalation via user meta"},
-        {"cve": "CVE-2022-21661", "desc": "WordPress < 5.8.3: SQL injection via WP_Query"},
+        {"cve": "CVE-2023-5561", "desc": "WordPress < 6.4.2: Privilege escalation via user meta", "affected_below": "6.4.2"},
+        {"cve": "CVE-2022-21661", "desc": "WordPress < 5.8.3: SQL injection via WP_Query", "affected_below": "5.8.3"},
+        {"cve": "CVE-2024-4439",  "desc": "WordPress < 6.5.2: XSS via HTML API",             "affected_below": "6.5.2"},
     ],
     "drupal": [
-        {"cve": "CVE-2018-7600", "desc": "Drupalgeddon2: Remote Code Execution"},
-        {"cve": "CVE-2019-6340", "desc": "Drupal REST RCE without auth"},
+        {"cve": "CVE-2018-7600", "desc": "Drupalgeddon2: Remote Code Execution",             "affected_below": "8.5.1"},
+        {"cve": "CVE-2019-6340", "desc": "Drupal REST RCE without auth",                     "affected_below": "8.6.10"},
+        {"cve": "CVE-2023-29197", "desc": "Drupal open redirect via guzzle",                 "affected_below": "10.0.8"},
     ],
     "laravel": [
-        {"cve": "CVE-2021-3129", "desc": "Laravel Debug mode RCE via Ignition"},
-        {"cve": "CVE-2018-15133", "desc": "Laravel token unserialize RCE"},
+        {"cve": "CVE-2021-3129", "desc": "Laravel Debug mode RCE via Ignition",              "affected_below": "8.4.3"},
+        {"cve": "CVE-2018-15133", "desc": "Laravel token unserialize RCE",                   "affected_below": "5.6.30"},
+        {"cve": "CVE-2021-43617", "desc": "Laravel log injection via user input",             "affected_below": "8.70.0"},
     ],
     "spring": [
-        {"cve": "CVE-2022-22965", "desc": "Spring4Shell: Spring MVC RCE"},
-        {"cve": "CVE-2022-22963", "desc": "Spring Cloud Function SpEL injection"},
+        {"cve": "CVE-2022-22965", "desc": "Spring4Shell: Spring MVC RCE",                    "affected_below": "5.3.18"},
+        {"cve": "CVE-2022-22963", "desc": "Spring Cloud Function SpEL injection",            "affected_below": "3.1.7"},
+        {"cve": "CVE-2023-20860", "desc": "Spring Framework Auth Bypass via wildcard",       "affected_below": "6.0.7"},
     ],
     "express": [
-        {"cve": "CVE-2022-24999", "desc": "qs prototype pollution in Express"},
+        {"cve": "CVE-2022-24999", "desc": "qs prototype pollution in Express",               "affected_below": "4.18.2"},
+        {"cve": "CVE-2024-29041", "desc": "Express open redirect via malformed URL",         "affected_below": "4.19.2"},
     ],
     "rails": [
-        {"cve": "CVE-2019-5418", "desc": "Rails File Content Disclosure via Accept header"},
-        {"cve": "CVE-2020-8164", "desc": "Rails strong params bypass"},
+        {"cve": "CVE-2019-5418", "desc": "Rails File Content Disclosure via Accept header",  "affected_below": "6.0.0"},
+        {"cve": "CVE-2020-8164", "desc": "Rails strong params bypass",                       "affected_below": "6.0.3.1"},
+        {"cve": "CVE-2023-28362", "desc": "Rails XSS via redirect_to with untrusted data",   "affected_below": "7.0.6"},
     ],
     "jenkins": [
-        {"cve": "CVE-2024-23897", "desc": "Jenkins < 2.442: Arbitrary file read via CLI"},
-        {"cve": "CVE-2023-27898", "desc": "Jenkins XSS leading to RCE"},
+        {"cve": "CVE-2024-23897", "desc": "Jenkins < 2.442: Arbitrary file read via CLI",   "affected_below": "2.442"},
+        {"cve": "CVE-2023-27898", "desc": "Jenkins XSS leading to RCE",                     "affected_below": "2.394"},
+        {"cve": "CVE-2024-43044", "desc": "Jenkins agent-to-controller file read",           "affected_below": "2.471"},
     ],
     "tomcat": [
-        {"cve": "CVE-2025-24813", "desc": "Tomcat partial PUT RCE"},
-        {"cve": "CVE-2020-1938", "desc": "Ghostcat: AJP file read/inclusion"},
+        {"cve": "CVE-2025-24813", "desc": "Tomcat partial PUT RCE",                         "affected_below": "11.0.3"},
+        {"cve": "CVE-2020-1938",  "desc": "Ghostcat: AJP file read/inclusion",              "affected_below": "9.0.31"},
+        {"cve": "CVE-2023-44487", "desc": "HTTP/2 Rapid Reset DoS (affects many servers)",  "affected_below": "10.1.14"},
     ],
     "graphql": [
-        {"cve": "N/A", "desc": "GraphQL introspection enabled: schema enumeration risk"},
+        {"cve": "N/A", "desc": "GraphQL introspection enabled: schema enumeration risk",     "affected_below": ""},
+        {"cve": "N/A", "desc": "GraphQL batch query abuse: potential DoS / brute-force",     "affected_below": ""},
+    ],
+    "nginx": [
+        {"cve": "CVE-2021-23017", "desc": "nginx DNS resolver 1-byte heap OOB write",       "affected_below": "1.20.1"},
+        {"cve": "CVE-2022-41742", "desc": "nginx NTLS heap read out of bound",              "affected_below": "1.23.2"},
+    ],
+    "apache": [
+        {"cve": "CVE-2021-41773", "desc": "Apache 2.4.49 path traversal / RCE",             "affected_below": "2.4.50"},
+        {"cve": "CVE-2021-42013", "desc": "Apache 2.4.49-50 path traversal bypass",         "affected_below": "2.4.51"},
+        {"cve": "CVE-2023-25690",  "desc": "Apache HTTP request smuggling via mod_proxy",   "affected_below": "2.4.56"},
+    ],
+    "nextjs": [
+        {"cve": "CVE-2024-34351", "desc": "Next.js SSRF via Host header manipulation",      "affected_below": "14.1.1"},
+        {"cve": "CVE-2024-46982", "desc": "Next.js cache poisoning via crafted request",    "affected_below": "14.2.10"},
+    ],
+    "django": [
+        {"cve": "CVE-2023-23969", "desc": "Django potential DoS via Accept-Language header","affected_below": "4.1.6"},
+        {"cve": "CVE-2024-27351", "desc": "Django regex DoS via truncated cookies",         "affected_below": "5.0.3"},
+    ],
+    "strapi": [
+        {"cve": "CVE-2023-22621", "desc": "Strapi RCE via server-side template injection",  "affected_below": "4.5.6"},
+        {"cve": "CVE-2023-34235", "desc": "Strapi improper access control in REST API",     "affected_below": "4.10.8"},
+    ],
+    "shopify": [
+        {"cve": "N/A", "desc": "Shopify theme: check for exposed /admin paths",             "affected_below": ""},
     ],
 }
 
@@ -715,8 +759,13 @@ class AsyncHTTPClient:
             "timeout": httpx.Timeout(self.config.timeout),
             "verify": self.config.verify_ssl,
             "limits": httpx.Limits(max_connections=self.config.max_concurrent * 2),
-            "http2": True,
         }
+        # http2 requires 'httpx[http2]' extra - enable only if available
+        try:
+            import h2  # noqa: F401
+            client_kwargs["http2"] = True
+        except ImportError:
+            pass
         if self.config.proxy:
             client_kwargs["proxy"] = self.config.proxy
             logger.info(f"Using proxy: {self.config.proxy}")
@@ -758,7 +807,11 @@ class AsyncHTTPClient:
                         url, headers=merged_headers, follow_redirects=allow_redirects
                     )
                     elapsed_time = round(time.time() - start, 3)
-                    response.elapsed_time = elapsed_time  # type: ignore[attr-defined]
+                    # Store elapsed time safely - httpx response may not accept arbitrary attrs
+                    try:
+                        response.elapsed_time = elapsed_time  # type: ignore[attr-defined]
+                    except (AttributeError, TypeError):
+                        pass
 
                     if response.status_code in [429, 503]:
                         retry_after = response.headers.get("Retry-After")
@@ -1087,20 +1140,89 @@ class TechnologyDetector:
             "waf": waf,
             "server": headers.get("server"),
             "powered_by": headers.get("x-powered-by"),
+            "versions": TechnologyDetector.extract_versions(headers, body),
         }
+
+    @staticmethod
+    def extract_versions(headers: httpx.Headers, body: str) -> Dict[str, str]:
+        """Extract version strings from headers and body for CVE accuracy."""
+        versions: Dict[str, str] = {}
+        server = headers.get("server", "")
+        powered_by = headers.get("x-powered-by", "")
+        generator = re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']', body, re.I)
+        gen_str = generator.group(1) if generator else ""
+
+        # Generic version patterns: "Technology/1.2.3" or "Technology 1.2.3"
+        version_pattern = re.compile(r'([\w\.\-]+)[/\s]v?(\d[\d\.]+\d)', re.I)
+        for source in [server, powered_by, gen_str]:
+            for m in version_pattern.finditer(source):
+                tech = m.group(1).lower()
+                ver = m.group(2)
+                versions[tech] = ver
+
+        # WordPress specific
+        wp_ver = re.search(r'WordPress[/\s](\d[\d\.]+)', body + gen_str, re.I)
+        if wp_ver:
+            versions["wordpress"] = wp_ver.group(1)
+        # Drupal
+        drupal_ver = re.search(r'Drupal[/\s](\d[\d\.]+)', body, re.I)
+        if drupal_ver:
+            versions["drupal"] = drupal_ver.group(1)
+        # Jenkins
+        jenkins_ver = headers.get("x-jenkins", "")
+        if jenkins_ver:
+            versions["jenkins"] = jenkins_ver.strip()
+        # Apache Tomcat
+        tomcat_m = re.search(r'Apache Tomcat[/\s](\d[\d\.]+)', server + body, re.I)
+        if tomcat_m:
+            versions["tomcat"] = tomcat_m.group(1)
+
+        return versions
 
     @staticmethod
     def get_cve_hints(technology_result: Dict[str, Any]) -> List[Dict[str, str]]:
         hints: List[Dict[str, str]] = []
         seen: Set[str] = set()
+        versions = technology_result.get("versions", {})
+
         for tech in technology_result.get("technologies", []):
             name = tech.get("name", "").lower()
             if name in CVE_HINTS:
+                detected_ver = versions.get(name, "")
                 for cve in CVE_HINTS[name]:
                     key = cve["cve"]
                     if key not in seen:
                         seen.add(key)
-                        hints.append({"tech": name, "cve": cve["cve"], "description": cve["desc"]})
+                        affected_below = cve.get("affected_below", "")
+                        version_note = ""
+                        version_status = "unknown"
+
+                        if detected_ver and affected_below:
+                            try:
+                                from packaging.version import Version
+                                if Version(detected_ver) < Version(affected_below):
+                                    version_status = "VULNERABLE"
+                                    version_note = f" [detected: {detected_ver} < {affected_below}]"
+                                else:
+                                    version_status = "patched"
+                                    version_note = f" [detected: {detected_ver} >= {affected_below}, likely patched]"
+                            except Exception:
+                                # packaging not available — simple string compare fallback
+                                version_note = f" [detected: {detected_ver}]"
+                                version_status = "unknown"
+                        elif detected_ver:
+                            version_note = f" [detected: {detected_ver}]"
+                        elif affected_below:
+                            version_note = f" [check if version < {affected_below}]"
+
+                        hints.append({
+                            "tech": name,
+                            "cve": cve["cve"],
+                            "description": cve["desc"] + version_note,
+                            "affected_below": affected_below,
+                            "detected_version": detected_ver,
+                            "version_status": version_status,
+                        })
         return hints
 
 
@@ -1172,7 +1294,11 @@ class CookieAnalyzer:
         findings: List[Finding] = []
         cookie_details: List[Dict[str, Any]] = []
 
-        set_cookie_headers = response.headers.get_list("set-cookie") if hasattr(response.headers, "get_list") else []
+        set_cookie_headers = []
+        # httpx stores multiple Set-Cookie headers in the raw headers list
+        for name, value in response.headers.raw:
+            if name.lower() == b"set-cookie":
+                set_cookie_headers.append(value.decode("latin-1", errors="replace"))
         if not set_cookie_headers:
             raw = response.headers.get("set-cookie")
             if raw:
@@ -2603,6 +2729,260 @@ class ReportGenerator:
         return json.dumps(asdict(result), indent=2, default=str)
 
     @staticmethod
+    def generate_markdown(result: ReconResult, only_high: bool = False) -> str:
+        """Generate a Markdown report. Pass only_high=True to limit findings to HIGH/CRITICAL."""
+        exec_s = result.executive_summary
+        sev_bd = exec_s.get("severity_breakdown", {})
+        stats = exec_s.get("stats", {})
+        ts = result.timestamp
+
+        severity_filter = {"HIGH", "CRITICAL"} if only_high else None
+
+        lines: List[str] = []
+        lines.append(f"# 🔍 Reconnaissance Report")
+        lines.append(f"")
+        lines.append(f"| Field | Value |")
+        lines.append(f"|---|---|")
+        lines.append(f"| **Target** | {result.target} |")
+        lines.append(f"| **Timestamp** | {ts} |")
+        lines.append(f"| **Speed** | {result.speed_used} |")
+        lines.append(f"| **Overall Severity** | {result.severity_score} |")
+        lines.append(f"| **Risk Score** | {exec_s.get('risk_score', 0)} |")
+        lines.append(f"| **Status Code** | {result.status_code} |")
+        lines.append(f"| **Response Time** | {result.response_time}s |")
+        lines.append(f"")
+
+        lines.append(f"## 📋 Executive Summary")
+        lines.append(f"")
+        lines.append(f"| Severity | Count |")
+        lines.append(f"|---|---|")
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+            lines.append(f"| {sev} | {sev_bd.get(sev, 0)} |")
+        lines.append(f"")
+
+        lines.append(f"### Stats")
+        lines.append(f"")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|---|---|")
+        for k, v in stats.items():
+            lines.append(f"| {k.replace('_', ' ').title()} | {v} |")
+        lines.append(f"")
+
+        # Technologies
+        techs = result.technology.get("technologies", [])
+        if techs:
+            lines.append(f"## 🖥️ Detected Technologies")
+            lines.append(f"")
+            lines.append(f"| Technology | Confidence |")
+            lines.append(f"|---|---|")
+            for t in techs:
+                lines.append(f"| {t.get('name','')} | {t.get('confidence',0)*100:.0f}% |")
+            lines.append(f"")
+        versions = result.technology.get("versions", {})
+        if versions:
+            lines.append(f"### Detected Versions")
+            lines.append(f"")
+            for tech, ver in versions.items():
+                lines.append(f"- **{tech}**: `{ver}`")
+            lines.append(f"")
+
+        # CVE hints
+        cve_hints = result.cve_hints
+        if only_high:
+            cve_hints = [h for h in cve_hints if h.get("version_status") == "VULNERABLE"]
+        if cve_hints:
+            lines.append(f"## ⚠️ CVE / Technology Hints")
+            lines.append(f"")
+            lines.append(f"| Tech | CVE | Status | Description |")
+            lines.append(f"|---|---|---|---|")
+            for h in cve_hints:
+                status = h.get("version_status", "unknown")
+                emoji = "🔴" if status == "VULNERABLE" else ("🟢" if status == "patched" else "🟡")
+                lines.append(f"| {h.get('tech','')} | {h.get('cve','')} | {emoji} {status} | {h.get('description','')} |")
+            lines.append(f"")
+
+        # Security findings
+        findings = result.findings
+        if severity_filter:
+            findings = [f for f in findings if f.get("severity") in severity_filter]
+        if findings:
+            lines.append(f"## 🔐 Security Findings")
+            if only_high:
+                lines.append(f"> ⚠️ Only HIGH and CRITICAL findings shown (`--only-high` mode)")
+            lines.append(f"")
+            for f in findings:
+                sev = f.get("severity", "INFO")
+                lines.append(f"### [{sev}] {f.get('title','')}")
+                lines.append(f"")
+                lines.append(f"- **Category:** {f.get('category','')}")
+                lines.append(f"- **Description:** {f.get('description','')}")
+                if f.get("evidence"):
+                    lines.append(f"- **Evidence:** `{f.get('evidence','')[:200]}`")
+                if f.get("remediation"):
+                    lines.append(f"- **Remediation:** {f.get('remediation','')}")
+                lines.append(f"")
+
+        # Nuclei
+        nuclei = result.nuclei_findings
+        if severity_filter:
+            nuclei = [n for n in nuclei if n.get("severity","").upper() in severity_filter]
+        if nuclei:
+            lines.append(f"## ⚡ Nuclei Findings")
+            lines.append(f"")
+            lines.append(f"| Severity | Name | CVE | Matched At |")
+            lines.append(f"|---|---|---|---|")
+            for nf in nuclei:
+                lines.append(f"| {nf.get('severity','')} | {nf.get('name','')} | {nf.get('cve','')} | `{nf.get('matched_at','')[:80]}` |")
+            lines.append(f"")
+
+        # S3
+        if result.s3_findings:
+            lines.append(f"## 🪣 S3 Bucket Findings")
+            lines.append(f"")
+            for s3 in result.s3_findings:
+                lines.append(f"- **{s3.get('bucket','')}** — {s3.get('status','')} [{s3.get('severity','')}]")
+                if s3.get("url"):
+                    lines.append(f"  - URL: `{s3.get('url','')}`")
+            lines.append(f"")
+
+        # GitHub
+        if result.github_dork_findings:
+            lines.append(f"## 🐙 GitHub Dorking Findings")
+            lines.append(f"")
+            for gh in result.github_dork_findings:
+                lines.append(f"- [{gh.get('repository','')}]({gh.get('url','')}) — `{gh.get('file','')}`")
+            lines.append(f"")
+
+        # Secrets
+        secrets_all = result.secrets + result.source_map_secrets
+        if secrets_all:
+            lines.append(f"## 🔑 Secrets Found")
+            lines.append(f"")
+            for s in secrets_all[:30]:
+                lines.append(f"- **{s.get('type', s.get('secret_type',''))}** in `{s.get('file', s.get('url',''))}`")
+            lines.append(f"")
+
+        # Subdomains
+        if result.subdomains:
+            lines.append(f"## 🌐 Subdomains ({len(result.subdomains)})")
+            lines.append(f"")
+            for sd in result.subdomains[:50]:
+                lines.append(f"- `{sd}`")
+            lines.append(f"")
+
+        # Open ports
+        if result.open_ports:
+            lines.append(f"## 🔓 Open Ports")
+            lines.append(f"")
+            lines.append(", ".join([f"`{p}`" for p in result.open_ports]))
+            lines.append(f"")
+
+        # Emails
+        if result.emails:
+            lines.append(f"## 📧 Emails Found")
+            lines.append(f"")
+            for e in result.emails:
+                lines.append(f"- `{e}`")
+            lines.append(f"")
+
+        # Endpoints
+        if result.endpoints:
+            lines.append(f"## 🔗 Endpoints ({len(result.endpoints)})")
+            lines.append(f"")
+            for ep in result.endpoints[:50]:
+                lines.append(f"- `{ep}`")
+            lines.append(f"")
+
+        # Parameters
+        if result.discovered_parameters:
+            lines.append(f"## 🧩 Discovered Parameters ({len(result.discovered_parameters)})")
+            lines.append(f"")
+            lines.append("`" + "`, `".join(result.discovered_parameters[:80]) + "`")
+            lines.append(f"")
+
+        # Errors
+        if result.errors:
+            lines.append(f"## ⚠️ Errors")
+            lines.append(f"")
+            for err in result.errors:
+                lines.append(f"- {err}")
+            lines.append(f"")
+
+        lines.append(f"---")
+        lines.append(f"*Generated by Argos Recon Tool — {ts}*")
+        return "\n".join(lines)
+
+    @staticmethod
+    def generate_diff(result_a: ReconResult, result_b: ReconResult) -> str:
+        """Compare two ReconResult scans and return a human-readable diff report."""
+        lines: List[str] = []
+        lines.append(f"# 🔄 Diff Report")
+        lines.append(f"")
+        lines.append(f"| | Scan A | Scan B |")
+        lines.append(f"|---|---|---|")
+        lines.append(f"| **Target** | {result_a.target} | {result_b.target} |")
+        lines.append(f"| **Timestamp** | {result_a.timestamp} | {result_b.timestamp} |")
+        lines.append(f"| **Severity** | {result_a.severity_score} | {result_b.severity_score} |")
+        lines.append(f"| **Risk Score** | {result_a.executive_summary.get('risk_score',0)} | {result_b.executive_summary.get('risk_score',0)} |")
+        lines.append(f"")
+
+        def diff_list(label: str, list_a: List[str], list_b: List[str]) -> None:
+            set_a = set(list_a)
+            set_b = set(list_b)
+            added = sorted(set_b - set_a)
+            removed = sorted(set_a - set_b)
+            if added or removed:
+                lines.append(f"### {label}")
+                lines.append(f"")
+                if added:
+                    lines.append(f"**New in Scan B ({len(added)}):**")
+                    for item in added[:20]:
+                        lines.append(f"- ✅ `{item}`")
+                if removed:
+                    lines.append(f"**Removed in Scan B ({len(removed)}):**")
+                    for item in removed[:20]:
+                        lines.append(f"- ❌ `{item}`")
+                lines.append(f"")
+
+        def diff_count(label: str, count_a: int, count_b: int) -> str:
+            delta = count_b - count_a
+            arrow = f"▲{delta}" if delta > 0 else (f"▼{abs(delta)}" if delta < 0 else "–")
+            return f"| **{label}** | {count_a} | {count_b} | {arrow} |"
+
+        lines.append(f"## 📊 Metric Changes")
+        lines.append(f"")
+        lines.append(f"| Metric | Scan A | Scan B | Delta |")
+        lines.append(f"|---|---|---|---|")
+        lines.append(diff_count("Subdomains",  len(result_a.subdomains), len(result_b.subdomains)))
+        lines.append(diff_count("Open Ports",  len(result_a.open_ports), len(result_b.open_ports)))
+        lines.append(diff_count("JS Files",    len(result_a.js_files),   len(result_b.js_files)))
+        lines.append(diff_count("Endpoints",   len(result_a.endpoints),  len(result_b.endpoints)))
+        lines.append(diff_count("Secrets",     len(result_a.secrets),    len(result_b.secrets)))
+        lines.append(diff_count("Emails",      len(result_a.emails),     len(result_b.emails)))
+        lines.append(diff_count("CVE Hints",   len(result_a.cve_hints),  len(result_b.cve_hints)))
+        lines.append(diff_count("Nuclei",      len(result_a.nuclei_findings), len(result_b.nuclei_findings)))
+        lines.append(diff_count("S3 Findings", len(result_a.s3_findings), len(result_b.s3_findings)))
+        lines.append(f"")
+
+        diff_list("🌐 Subdomains", result_a.subdomains, result_b.subdomains)
+        diff_list("🔓 Open Ports", [str(p) for p in result_a.open_ports], [str(p) for p in result_b.open_ports])
+        diff_list("🔗 Endpoints",  result_a.endpoints,  result_b.endpoints)
+
+        # Findings diff by title
+        titles_a = [f.get("title","") for f in result_a.findings]
+        titles_b = [f.get("title","") for f in result_b.findings]
+        diff_list("🔐 Security Findings", titles_a, titles_b)
+
+        # CVE diff
+        cve_a = [h.get("cve","") for h in result_a.cve_hints]
+        cve_b = [h.get("cve","") for h in result_b.cve_hints]
+        diff_list("⚠️ CVE Hints", cve_a, cve_b)
+
+        lines.append(f"---")
+        lines.append(f"*Diff generated by Argos Recon Tool*")
+        return "\n".join(lines)
+
+    @staticmethod
     def generate_html(result: ReconResult) -> str:
         findings_html = ""
         for f in result.findings:
@@ -2936,14 +3316,65 @@ class ReconEngine:
         self.dns = DNSRecon()
         self.port_scanner = PortScanner(self.config)
 
+    # ------------------------------------------------------------------
+    # Resume helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resume_path(target: str, resume_file: Optional[str]) -> Path:
+        if resume_file:
+            return Path(resume_file)
+        h = hashlib.md5(target.encode()).hexdigest()[:8]
+        return Path(f".argos_resume_{h}.pkl")
+
+    def _save_checkpoint(self, target: str, result: ReconResult, all_findings: List[Finding], step: str) -> None:
+        try:
+            path = self._resume_path(target, self.config.resume_file)
+            with open(path, "wb") as f:
+                pickle.dump({"result": result, "findings": all_findings, "step": step}, f)
+            logger.debug(f"Checkpoint saved at step '{step}' → {path}")
+        except Exception as e:
+            logger.warning(f"Failed to save checkpoint: {e}")
+
+    def _load_checkpoint(self, target: str) -> Optional[Tuple[ReconResult, List[Finding], str]]:
+        try:
+            path = self._resume_path(target, self.config.resume_file)
+            if not path.exists():
+                return None
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            return data["result"], data["findings"], data["step"]
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}")
+            return None
+
+    def _clear_checkpoint(self, target: str) -> None:
+        try:
+            path = self._resume_path(target, self.config.resume_file)
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
     async def run(self, target: str, options: Optional[Dict[str, Any]] = None) -> ReconResult:
         if options is None:
             options = {}
 
         url = normalize_url(target)
         domain = get_domain(url)
-        result = ReconResult(target=url, speed_used=self.config.speed)
-        all_findings: List[Finding] = []
+
+        # --- Resume: always check for an existing checkpoint ---
+        resumed_result: Optional[ReconResult] = None
+        resumed_findings: List[Finding] = []
+        resume_from_step: str = ""
+        checkpoint = self._load_checkpoint(url)
+        if checkpoint:
+            resumed_result, resumed_findings, resume_from_step = checkpoint
+            self.console.print(
+                f"[bold yellow]⏩ Resuming from checkpoint (last completed: '{resume_from_step}')[/bold yellow]"
+            )
+
+        result = resumed_result if resumed_result else ReconResult(target=url, speed_used=self.config.speed)
+        all_findings: List[Finding] = resumed_findings if resumed_findings else []
 
         self.console.print(f"\n[bold blue]{'='*60}[/bold blue]")
         self.console.print(f"[bold blue]TARGET: {url}[/bold blue]")
@@ -2969,16 +3400,19 @@ class ReconEngine:
                     transient=False,
                 ) as progress:
                     result, all_findings = await self._run_recon(
-                        client, url, domain, result, all_findings, progress
+                        client, url, domain, result, all_findings, progress, resume_from_step
                     )
             else:
                 result, all_findings = await self._run_recon(
-                    client, url, domain, result, all_findings, None
+                    client, url, domain, result, all_findings, None, resume_from_step
                 )
 
         result.findings = [asdict(f) for f in all_findings]
         result.severity_score = calculate_severity(all_findings)
         result.executive_summary = build_executive_summary(result, all_findings)
+
+        # Clear checkpoint on success
+        self._clear_checkpoint(url)
 
         return result
 
@@ -2989,175 +3423,254 @@ class ReconEngine:
         domain: str,
         result: ReconResult,
         all_findings: List[Finding],
-        progress: Optional[Progress]
+        progress: Optional[Progress],
+        resume_from_step: str = "",
     ) -> Tuple[ReconResult, List[Finding]]:
 
         task_id = None
         if progress:
             task_id = progress.add_task("[cyan]Starting...", total=100)
 
+        # Initialize js_analysis early so S3 step can always access it safely
+        js_analysis: Dict[str, Any] = {"s3_buckets": [], "endpoints": [], "secrets": [],
+                                        "source_map_secrets": [], "emails": [], "internal_domains": []}
+
         def update(description: str, completed: int) -> None:
             if progress and task_id is not None:
                 progress.update(task_id, description=description, completed=completed)
 
+        # Step names ordered — used for resume skip logic
+        STEPS = [
+            "initial_request", "tech_detect", "cve_hints", "sec_headers",
+            "cookies", "takeover", "emails", "robots", "dns", "subdomains",
+            "ports", "ssl", "crawl", "js_crawl", "wayback", "endpoints",
+            "open_redirect", "http_fuzz", "source_maps", "s3", "github",
+            "nuclei", "param_discovery", "screenshot",
+        ]
+
+        def should_skip(step: str) -> bool:
+            if not resume_from_step:
+                return False
+            if step in STEPS and resume_from_step in STEPS:
+                return STEPS.index(step) <= STEPS.index(resume_from_step)
+            return False
+
+        def checkpoint(step: str) -> None:
+            result.scan_checkpoint = step
+            self._save_checkpoint(url, result, all_findings, step)
+
         # 1. Initial request
-        try:
-            update("[cyan]Initial request...", 3)
-            response = await client.get(url)
-            if not response:
-                result.errors.append("Failed to reach target")
+        body = ""
+        response = None
+        if not should_skip("initial_request"):
+            try:
+                update("[cyan]Initial request...", 3)
+                response = await client.get(url)
+                if not response:
+                    result.errors.append("Failed to reach target")
+                    return result, all_findings
+                result.status_code = response.status_code
+                result.response_time = getattr(response, 'elapsed_time', 0.0)
+                body = response.text
+                checkpoint("initial_request")
+            except Exception as e:
+                result.errors.append(f"Initial request failed: {e}")
                 return result, all_findings
-            result.status_code = response.status_code
-            result.response_time = getattr(response, 'elapsed_time', 0.0)
-            body = response.text
-        except Exception as e:
-            result.errors.append(f"Initial request failed: {e}")
-            return result, all_findings
+        else:
+            # Re-issue initial request even on resume (headers/body needed for later steps)
+            update("[cyan]Re-fetching page for resumed scan...", 3)
+            try:
+                response = await client.get(url)
+                if response:
+                    body = response.text
+            except Exception:
+                pass
 
         # 2. Technology detection
-        try:
-            update("[cyan]Detecting technologies...", 6)
-            result.technology = TechnologyDetector.detect(response.headers, body, str(response.cookies))
-        except Exception as e:
-            result.errors.append(f"Technology detection failed: {e}")
+        if not should_skip("tech_detect"):
+            try:
+                update("[cyan]Detecting technologies...", 6)
+                if response:
+                    result.technology = TechnologyDetector.detect(response.headers, body, str(response.cookies))
+                checkpoint("tech_detect")
+            except Exception as e:
+                result.errors.append(f"Technology detection failed: {e}")
 
         # 3. CVE hints
-        try:
-            update("[cyan]Checking CVE hints...", 8)
-            result.cve_hints = TechnologyDetector.get_cve_hints(result.technology)
-        except Exception as e:
-            result.errors.append(f"CVE hint lookup failed: {e}")
+        if not should_skip("cve_hints"):
+            try:
+                update("[cyan]Checking CVE hints...", 8)
+                result.cve_hints = TechnologyDetector.get_cve_hints(result.technology)
+                checkpoint("cve_hints")
+            except Exception as e:
+                result.errors.append(f"CVE hint lookup failed: {e}")
 
         # 4. Security headers
-        try:
-            update("[cyan]Analyzing security headers...", 11)
-            result.security_headers, header_findings = SecurityHeadersAnalyzer.analyze(response.headers)
-            all_findings.extend(header_findings)
-        except Exception as e:
-            result.errors.append(f"Security headers analysis failed: {e}")
+        if not should_skip("sec_headers"):
+            try:
+                update("[cyan]Analyzing security headers...", 11)
+                if response:
+                    result.security_headers, header_findings = SecurityHeadersAnalyzer.analyze(response.headers)
+                    all_findings.extend(header_findings)
+                checkpoint("sec_headers")
+            except Exception as e:
+                result.errors.append(f"Security headers analysis failed: {e}")
 
         # 5. Cookie analysis
-        try:
-            update("[cyan]Analyzing cookies...", 13)
-            result.cookies_analysis, cookie_findings = CookieAnalyzer.analyze(response)
-            all_findings.extend(cookie_findings)
-        except Exception as e:
-            result.errors.append(f"Cookie analysis failed: {e}")
+        if not should_skip("cookies"):
+            try:
+                update("[cyan]Analyzing cookies...", 13)
+                if response:
+                    result.cookies_analysis, cookie_findings = CookieAnalyzer.analyze(response)
+                    all_findings.extend(cookie_findings)
+                checkpoint("cookies")
+            except Exception as e:
+                result.errors.append(f"Cookie analysis failed: {e}")
 
         # 6. Subdomain takeover
-        try:
-            update("[cyan]Checking subdomain takeover...", 15)
-            takeover_findings = SubdomainTakeoverChecker.check(body, response.headers)
-            all_findings.extend(takeover_findings)
-        except Exception as e:
-            result.errors.append(f"Subdomain takeover check failed: {e}")
+        if not should_skip("takeover"):
+            try:
+                update("[cyan]Checking subdomain takeover...", 15)
+                if response:
+                    takeover_findings = SubdomainTakeoverChecker.check(body, response.headers)
+                    all_findings.extend(takeover_findings)
+                checkpoint("takeover")
+            except Exception as e:
+                result.errors.append(f"Subdomain takeover check failed: {e}")
 
         # 7. Email harvesting
-        try:
-            update("[cyan]Harvesting emails...", 17)
-            result.emails = extract_emails(body)
-        except Exception as e:
-            result.errors.append(f"Email harvesting failed: {e}")
+        if not should_skip("emails"):
+            try:
+                update("[cyan]Harvesting emails...", 17)
+                result.emails = extract_emails(body)
+                checkpoint("emails")
+            except Exception as e:
+                result.errors.append(f"Email harvesting failed: {e}")
 
         # 8. Robots.txt + Sitemap
-        try:
-            update("[cyan]Parsing robots.txt / sitemap...", 19)
-            robots_paths = await RobotsParser.parse_robots(client, url)
-            sitemap_urls = await RobotsParser.parse_sitemap(client, url)
-            result.robots_paths = robots_paths
-            extra_paths = [p for p in robots_paths if p not in COMMON_PATHS]
-            COMMON_PATHS.extend(extra_paths[:30])
-        except Exception as e:
-            result.errors.append(f"Robots/sitemap parsing failed: {e}")
+        if not should_skip("robots"):
+            try:
+                update("[cyan]Parsing robots.txt / sitemap...", 19)
+                robots_paths = await RobotsParser.parse_robots(client, url)
+                sitemap_urls = await RobotsParser.parse_sitemap(client, url)
+                result.robots_paths = robots_paths
+                extra_paths = [p for p in robots_paths if p not in COMMON_PATHS]
+                # Also add sitemap-derived paths
+                for surl in sitemap_urls[:20]:
+                    try:
+                        spath = urlparse(surl).path
+                        if spath and spath != "/" and spath not in COMMON_PATHS:
+                            extra_paths.append(spath)
+                    except Exception:
+                        pass
+                COMMON_PATHS.extend(extra_paths[:30])
+                checkpoint("robots")
+            except Exception as e:
+                result.errors.append(f"Robots/sitemap parsing failed: {e}")
 
         # 9. DNS records
-        try:
-            update("[cyan]Querying DNS records...", 22)
-            result.dns_records = await self.dns.get_records(domain)
-        except Exception as e:
-            result.errors.append(f"DNS query failed: {e}")
+        if not should_skip("dns"):
+            try:
+                update("[cyan]Querying DNS records...", 22)
+                result.dns_records = await self.dns.get_records(domain)
+                checkpoint("dns")
+            except Exception as e:
+                result.errors.append(f"DNS query failed: {e}")
 
         # 10. Subdomain enumeration
-        try:
-            update("[cyan]Enumerating subdomains...", 27)
-            crtsh_subs = await SubdomainFinder.from_crtsh(client, domain)
-            ht_subs = await SubdomainFinder.from_hackertarget(client, domain)
-            brute_subs = await self.dns.brute_subdomains(domain)
-            all_subs = crtsh_subs | ht_subs | brute_subs
-            result.subdomains = list(all_subs)[:self.config.max_subdomains]
-        except Exception as e:
-            result.errors.append(f"Subdomain enumeration failed: {e}")
+        if not should_skip("subdomains"):
+            try:
+                update("[cyan]Enumerating subdomains...", 27)
+                crtsh_subs = await SubdomainFinder.from_crtsh(client, domain)
+                ht_subs = await SubdomainFinder.from_hackertarget(client, domain)
+                brute_subs = await self.dns.brute_subdomains(domain)
+                all_subs = crtsh_subs | ht_subs | brute_subs
+                result.subdomains = list(all_subs)[:self.config.max_subdomains]
+                checkpoint("subdomains")
+            except Exception as e:
+                result.errors.append(f"Subdomain enumeration failed: {e}")
 
         # 11. Port scanning
-        try:
-            update("[cyan]Scanning ports...", 33)
-            result.open_ports = await self.port_scanner.scan(domain)
-        except Exception as e:
-            result.errors.append(f"Port scanning failed: {e}")
+        if not should_skip("ports"):
+            try:
+                update("[cyan]Scanning ports...", 33)
+                result.open_ports = await self.port_scanner.scan(domain)
+                checkpoint("ports")
+            except Exception as e:
+                result.errors.append(f"Port scanning failed: {e}")
 
         # 12. SSL analysis
-        try:
-            update("[cyan]Analyzing SSL certificate...", 36)
-            result.ssl_info = await SSLAnalyzer.analyze(domain)
-        except Exception as e:
-            result.errors.append(f"SSL analysis failed: {e}")
+        if not should_skip("ssl"):
+            try:
+                update("[cyan]Analyzing SSL certificate...", 36)
+                result.ssl_info = await SSLAnalyzer.analyze(domain)
+                checkpoint("ssl")
+            except Exception as e:
+                result.errors.append(f"SSL analysis failed: {e}")
 
         # 13. Crawling
-        try:
-            update("[cyan]Crawling website...", 40)
-            crawler = Crawler(client, self.config)
-            _, js_files = await crawler.crawl(url)
-            result.js_files = list(js_files)[:self.config.max_js_files]
-            result.emails = list(set(result.emails) | crawler.found_emails)[:100]
-        except Exception as e:
-            result.errors.append(f"Crawling failed: {e}")
+        if not should_skip("crawl"):
+            try:
+                update("[cyan]Crawling website...", 40)
+                crawler = Crawler(client, self.config)
+                _, js_files = await crawler.crawl(url)
+                result.js_files = list(js_files)[:self.config.max_js_files]
+                result.emails = list(set(result.emails) | crawler.found_emails)[:100]
+                checkpoint("crawl")
+            except Exception as e:
+                result.errors.append(f"Crawling failed: {e}")
 
         # 14. JS analysis
         js_files_content: List[str] = []
-        try:
-            update("[cyan]Analyzing JavaScript files...", 45)
-            js_analysis = await JSAnalyzer.analyze(client, result.js_files, self.config)
-            result.endpoints = js_analysis["endpoints"]
-            result.secrets = js_analysis["secrets"]
-            result.source_map_secrets = js_analysis.get("source_map_secrets", [])
-            result.emails = list(set(result.emails) | set(js_analysis.get("emails", [])))[:100]
+        if not should_skip("js_crawl"):
+            try:
+                update("[cyan]Analyzing JavaScript files...", 45)
+                js_analysis = await JSAnalyzer.analyze(client, result.js_files, self.config)
+                result.endpoints = js_analysis["endpoints"]
+                result.secrets = js_analysis["secrets"]
+                result.source_map_secrets = js_analysis.get("source_map_secrets", [])
+                result.emails = list(set(result.emails) | set(js_analysis.get("emails", [])))[:100]
 
-            for secret in result.secrets + result.source_map_secrets:
-                all_findings.append(Finding(
-                    category="Secrets", severity="HIGH",
-                    title=f"Exposed {secret['type']}",
-                    description=f"Found in {secret['source']}",
-                    evidence=secret['value']
-                ))
+                for secret in result.secrets + result.source_map_secrets:
+                    all_findings.append(Finding(
+                        category="Secrets", severity="HIGH",
+                        title=f"Exposed {secret['type']}",
+                        description=f"Found in {secret['source']}",
+                        evidence=secret['value']
+                    ))
 
-            # JS içeriklerini parametre keşfi için sakla
-            for js_url in result.js_files[:10]:
-                try:
-                    r = await client.get(js_url)
-                    if r and r.status_code == 200:
-                        js_files_content.append(r.text)
-                except Exception:
-                    pass
-
-        except Exception as e:
-            result.errors.append(f"JS analysis failed: {e}")
+                # JS içeriklerini parametre keşfi için sakla
+                for js_url in result.js_files[:10]:
+                    try:
+                        r = await client.get(js_url)
+                        if r and r.status_code == 200:
+                            js_files_content.append(r.text)
+                    except Exception:
+                        pass
+                checkpoint("js_crawl")
+            except Exception as e:
+                result.errors.append(f"JS analysis failed: {e}")
 
         # 15. Wayback Machine
-        try:
-            update("[cyan]Fetching Wayback URLs...", 50)
-            result.wayback_urls = await WaybackMachine.get_urls(client, domain, limit=50)
-            wayback_endpoints = WaybackMachine.extract_endpoints_from_urls(result.wayback_urls)
-            result.endpoints = list(set(result.endpoints) | wayback_endpoints)[:self.config.max_endpoints]
-        except Exception as e:
-            result.errors.append(f"Wayback Machine query failed: {e}")
+        if not should_skip("wayback"):
+            try:
+                update("[cyan]Fetching Wayback URLs...", 50)
+                result.wayback_urls = await WaybackMachine.get_urls(client, domain, limit=50)
+                wayback_endpoints = WaybackMachine.extract_endpoints_from_urls(result.wayback_urls)
+                result.endpoints = list(set(result.endpoints) | wayback_endpoints)[:self.config.max_endpoints]
+                checkpoint("wayback")
+            except Exception as e:
+                result.errors.append(f"Wayback Machine query failed: {e}")
 
         # 16. CORS testing
-        try:
-            update("[cyan]Testing CORS...", 54)
-            cors_findings = await CORSTester.test(client, url)
-            all_findings.extend(cors_findings)
-        except Exception as e:
-            result.errors.append(f"CORS testing failed: {e}")
+        if not should_skip("endpoints"):
+            try:
+                update("[cyan]Testing CORS...", 54)
+                cors_findings = await CORSTester.test(client, url)
+                all_findings.extend(cors_findings)
+                checkpoint("endpoints")
+            except Exception as e:
+                result.errors.append(f"CORS testing failed: {e}")
 
         # 17. GraphQL probing
         try:
@@ -3195,114 +3708,128 @@ class ReconEngine:
             result.errors.append(f"Directory discovery failed: {e}")
 
         # 19. Open Redirect testing
-        try:
-            update("[cyan]Testing open redirects...", 65)
-            or_findings = await OpenRedirectTester.test(client, url, result.endpoints)
-            result.open_redirect_findings = or_findings
-            for vuln_url in or_findings:
-                all_findings.append(Finding(
-                    category="Open Redirect", severity="MEDIUM",
-                    title="Open Redirect Detected",
-                    description="URL parameter reflects external redirect",
-                    evidence=vuln_url,
-                    remediation="Validate and whitelist redirect destinations"
-                ))
-        except Exception as e:
-            result.errors.append(f"Open redirect testing failed: {e}")
+        if not should_skip("open_redirect"):
+            try:
+                update("[cyan]Testing open redirects...", 65)
+                or_findings = await OpenRedirectTester.test(client, url, result.endpoints)
+                result.open_redirect_findings = or_findings
+                for vuln_url in or_findings:
+                    all_findings.append(Finding(
+                        category="Open Redirect", severity="MEDIUM",
+                        title="Open Redirect Detected",
+                        description="URL parameter reflects external redirect",
+                        evidence=vuln_url,
+                        remediation="Validate and whitelist redirect destinations"
+                    ))
+                checkpoint("open_redirect")
+            except Exception as e:
+                result.errors.append(f"Open redirect testing failed: {e}")
 
         # 20. HTTP Method fuzzing
-        try:
-            update("[cyan]Fuzzing HTTP methods...", 68)
-            method_results = await HTTPMethodFuzzer.fuzz(client, url)
-            result.http_method_findings = method_results
-            for mf in method_results:
-                if mf["method"] in ["TRACE", "PUT", "DELETE"] and mf["status"] in [200, 201, 204]:
-                    all_findings.append(Finding(
-                        category="HTTP Methods", severity="MEDIUM",
-                        title=f"Dangerous HTTP Method Allowed: {mf['method']}",
-                        description=f"Method {mf['method']} returned status {mf['status']} on {mf['path']}",
-                        evidence=mf["url"],
-                        remediation=f"Disable {mf['method']} method if not required"
-                    ))
-        except Exception as e:
-            result.errors.append(f"HTTP method fuzzing failed: {e}")
+        if not should_skip("http_fuzz"):
+            try:
+                update("[cyan]Fuzzing HTTP methods...", 68)
+                method_results = await HTTPMethodFuzzer.fuzz(client, url)
+                result.http_method_findings = method_results
+                for mf in method_results:
+                    if mf["method"] in ["TRACE", "PUT", "DELETE"] and mf["status"] in [200, 201, 204]:
+                        all_findings.append(Finding(
+                            category="HTTP Methods", severity="MEDIUM",
+                            title=f"Dangerous HTTP Method Allowed: {mf['method']}",
+                            description=f"Method {mf['method']} returned status {mf['status']} on {mf['path']}",
+                            evidence=mf["url"],
+                            remediation=f"Disable {mf['method']} method if not required"
+                        ))
+                checkpoint("http_fuzz")
+            except Exception as e:
+                result.errors.append(f"HTTP method fuzzing failed: {e}")
 
         # =========================================================
         # 21. NEW: S3 Bucket Misconfig Checker
         # =========================================================
-        try:
-            update("[cyan]Checking S3 buckets...", 72)
-            js_buckets = js_analysis.get("s3_buckets", []) if 'js_analysis' in dir() else []
-            s3_results, s3_findings = await S3BucketChecker.run(
-                client, domain, result.subdomains, js_buckets, body
-            )
-            result.s3_findings = s3_results
-            all_findings.extend(s3_findings)
-        except Exception as e:
-            result.errors.append(f"S3 bucket check failed: {e}")
+        if not should_skip("s3"):
+            try:
+                update("[cyan]Checking S3 buckets...", 72)
+                js_buckets = js_analysis.get("s3_buckets", [])
+                s3_results, s3_findings = await S3BucketChecker.run(
+                    client, domain, result.subdomains, js_buckets, body
+                )
+                result.s3_findings = s3_results
+                all_findings.extend(s3_findings)
+                checkpoint("s3")
+            except Exception as e:
+                result.errors.append(f"S3 bucket check failed: {e}")
 
         # =========================================================
         # 22. NEW: GitHub Dorking
         # =========================================================
-        try:
-            update("[cyan]GitHub dorking...", 76)
-            gh_results, gh_findings = await GitHubDorker.search(
-                client, domain, token=self.config.github_token
-            )
-            result.github_dork_findings = gh_results
-            all_findings.extend(gh_findings)
-        except Exception as e:
-            result.errors.append(f"GitHub dorking failed: {e}")
+        if not should_skip("github"):
+            try:
+                update("[cyan]GitHub dorking...", 76)
+                gh_results, gh_findings = await GitHubDorker.search(
+                    client, domain, token=self.config.github_token
+                )
+                result.github_dork_findings = gh_results
+                all_findings.extend(gh_findings)
+                checkpoint("github")
+            except Exception as e:
+                result.errors.append(f"GitHub dorking failed: {e}")
 
         # =========================================================
         # 23. NEW: Nuclei Integration
         # =========================================================
-        try:
-            update("[cyan]Running Nuclei...", 81)
-            if NucleiScanner.is_available(self.config.nuclei_path):
-                output_dir = Path("./reports")
-                nuclei_results, nuclei_findings = await NucleiScanner.scan(
-                    target=url,
-                    nuclei_path=self.config.nuclei_path,
-                    output_dir=output_dir,
-                    severity_filter="medium,high,critical",
-                    timeout_seconds=120,
-                )
-                result.nuclei_findings = nuclei_results
-                all_findings.extend(nuclei_findings)
-            else:
-                logger.info("Nuclei not available, skipping")
-        except Exception as e:
-            result.errors.append(f"Nuclei scan failed: {e}")
+        if not should_skip("nuclei"):
+            try:
+                update("[cyan]Running Nuclei...", 81)
+                if NucleiScanner.is_available(self.config.nuclei_path):
+                    output_dir = Path("./reports")
+                    nuclei_results, nuclei_findings = await NucleiScanner.scan(
+                        target=url,
+                        nuclei_path=self.config.nuclei_path,
+                        output_dir=output_dir,
+                        severity_filter="medium,high,critical",
+                        timeout_seconds=120,
+                    )
+                    result.nuclei_findings = nuclei_results
+                    all_findings.extend(nuclei_findings)
+                else:
+                    logger.info("Nuclei not available, skipping")
+                checkpoint("nuclei")
+            except Exception as e:
+                result.errors.append(f"Nuclei scan failed: {e}")
 
         # =========================================================
         # 24. NEW: Parameter Discovery
         # =========================================================
-        try:
-            update("[cyan]Discovering parameters...", 88)
-            result.discovered_parameters = await ParameterDiscovery.discover(
-                client=client,
-                base_url=url,
-                html_content=body,
-                js_files_content=js_files_content,
-                wayback_urls=result.wayback_urls,
-            )
-        except Exception as e:
-            result.errors.append(f"Parameter discovery failed: {e}")
+        if not should_skip("param_discovery"):
+            try:
+                update("[cyan]Discovering parameters...", 88)
+                result.discovered_parameters = await ParameterDiscovery.discover(
+                    client=client,
+                    base_url=url,
+                    html_content=body,
+                    js_files_content=js_files_content,
+                    wayback_urls=result.wayback_urls,
+                )
+                checkpoint("param_discovery")
+            except Exception as e:
+                result.errors.append(f"Parameter discovery failed: {e}")
 
         # =========================================================
         # 25. NEW: Screenshot Capture
         # =========================================================
-        try:
-            update("[cyan]Taking screenshot...", 94)
-            if self.config.screenshot_enabled:
-                output_dir = Path("./reports")
-                screenshot_path = await ScreenshotCapture.capture(url, output_dir)
-                result.screenshot_path = screenshot_path
-            else:
-                logger.info("Screenshot disabled, use --screenshot to enable")
-        except Exception as e:
-            result.errors.append(f"Screenshot capture failed: {e}")
+        if not should_skip("screenshot"):
+            try:
+                update("[cyan]Taking screenshot...", 94)
+                if self.config.screenshot_enabled:
+                    output_dir = Path("./reports")
+                    screenshot_path = await ScreenshotCapture.capture(url, output_dir)
+                    result.screenshot_path = screenshot_path
+                else:
+                    logger.info("Screenshot disabled, use --screenshot to enable")
+                checkpoint("screenshot")
+            except Exception as e:
+                result.errors.append(f"Screenshot capture failed: {e}")
 
         update("[cyan]Complete!", 100)
         return result, all_findings
@@ -3323,6 +3850,8 @@ async def async_main(args: argparse.Namespace) -> None:
     config.nuclei_path = getattr(args, 'nuclei_path', 'nuclei')
     config.screenshot_enabled = getattr(args, 'screenshot', False)
     config.hackerone_username = getattr(args, 'hackerone_username', None)
+    config.only_high = getattr(args, 'only_high', False)
+    config.resume_file = getattr(args, 'resume_file', None)
 
     if args.concurrent:
         config.max_concurrent = args.concurrent
@@ -3330,6 +3859,12 @@ async def async_main(args: argparse.Namespace) -> None:
         config.timeout = args.timeout
     if args.depth:
         config.max_depth = args.depth
+
+    # --- API MODE ---
+    if getattr(args, 'api', False):
+        _run_api_server(config, host=getattr(args, 'api_host', '0.0.0.0'),
+                        port=getattr(args, 'api_port', 5000))
+        return
 
     console.print(f"\n[bold yellow]⚡ Speed Level: {speed}[/bold yellow]")
     console.print(f"[dim]{describe_speed(speed)}[/dim]")
@@ -3340,7 +3875,8 @@ async def async_main(args: argparse.Namespace) -> None:
         f"github_token={'✓' if config.github_token else '✗'}, "
         f"nuclei={'✓' if NucleiScanner.is_available(config.nuclei_path) else '✗ (not installed)'}, "
         f"screenshot={'✓' if config.screenshot_enabled else '✗'}, "
-        f"h1_user={'✓ ' + config.hackerone_username if config.hackerone_username else '✗'}[/dim]\n"
+        f"h1_user={'✓ ' + config.hackerone_username if config.hackerone_username else '✗'},"
+        f"only_high={config.only_high}[/dim]\n"
     )
 
     targets: List[str] = []
@@ -3356,6 +3892,11 @@ async def async_main(args: argparse.Namespace) -> None:
         except Exception as e:
             console.print(f"[red]Error reading file: {e}[/red]")
             return
+
+    # --- DIFF MODE ---
+    if getattr(args, 'diff', None):
+        await _run_diff_mode(args, config, console, targets)
+        return
 
     if not targets:
         user_input = console.input("[bold]Enter target URL(s) (comma-separated): [/bold]")
@@ -3384,7 +3925,7 @@ async def async_main(args: argparse.Namespace) -> None:
             domain = get_domain(result.target).replace(".", "_")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            if args.json or (not args.json and not args.html):
+            if args.json or (not args.json and not args.html and not getattr(args, 'markdown', False)):
                 json_path = output_dir / f"{domain}_{timestamp}_speed{speed}.json"
                 json_path.write_text(ReportGenerator.generate_json(result))
                 console.print(f"\n[green]JSON report saved: {json_path}[/green]")
@@ -3393,6 +3934,11 @@ async def async_main(args: argparse.Namespace) -> None:
                 html_path = output_dir / f"{domain}_{timestamp}_speed{speed}.html"
                 html_path.write_text(ReportGenerator.generate_html(result), encoding="utf-8")
                 console.print(f"[green]HTML report saved: {html_path}[/green]")
+
+            if getattr(args, 'markdown', False):
+                md_path = output_dir / f"{domain}_{timestamp}_speed{speed}.md"
+                md_path.write_text(ReportGenerator.generate_markdown(result, only_high=config.only_high), encoding="utf-8")
+                console.print(f"[green]Markdown report saved: {md_path}[/green]")
 
             if not args.quiet:
                 console.print("\n[bold cyan]JSON Report:[/bold cyan]")
@@ -3408,6 +3954,122 @@ async def async_main(args: argparse.Namespace) -> None:
             logger.exception(f"Unexpected error scanning {target}")
 
     console.print("\n[bold green]✓ Scan complete![/bold green]")
+
+
+async def _run_diff_mode(
+    args: argparse.Namespace,
+    config: 'Config',
+    console: ConsoleInterface,
+    targets: List[str],
+) -> None:
+    """Load two JSON reports and produce a diff."""
+    diff_files = getattr(args, 'diff', None)
+    if not diff_files or len(diff_files) != 2:
+        console.print("[red]--diff requires exactly 2 JSON report paths[/red]")
+        return
+    try:
+        data_a = json.loads(Path(diff_files[0]).read_text())
+        data_b = json.loads(Path(diff_files[1]).read_text())
+    except Exception as e:
+        console.print(f"[red]Failed to load diff reports: {e}[/red]")
+        return
+
+    # Reconstruct minimal ReconResult objects from dicts
+    def _dict_to_result(d: Dict[str, Any]) -> ReconResult:
+        r = ReconResult(target=d.get("target", ""))
+        for k, v in d.items():
+            if hasattr(r, k):
+                setattr(r, k, v)
+        return r
+
+    result_a = _dict_to_result(data_a)
+    result_b = _dict_to_result(data_b)
+
+    diff_md = ReportGenerator.generate_diff(result_a, result_b)
+    output_dir = Path(getattr(args, 'output', './reports'))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    diff_path = output_dir / f"diff_{ts}.md"
+    diff_path.write_text(diff_md, encoding="utf-8")
+    console.print(f"[green]Diff report saved: {diff_path}[/green]")
+    if not getattr(args, 'quiet', False):
+        console.print(diff_md)
+
+
+def _run_api_server(config: 'Config', host: str = "0.0.0.0", port: int = 5000) -> None:
+    """Start a minimal Flask REST API server."""
+    try:
+        from flask import Flask, request, jsonify
+    except ImportError:
+        print("Flask not installed. Install with: pip install flask")
+        sys.exit(1)
+
+    app = Flask("argos-api")
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok", "tool": "Argos Recon Tool"})
+
+    @app.route("/scan", methods=["POST"])
+    def scan():
+        import asyncio as _asyncio
+        data = request.get_json(force=True) or {}
+        target = data.get("target", "")
+        if not target:
+            return jsonify({"error": "target is required"}), 400
+
+        # Per-request config overrides
+        cfg = config.copy()
+        cfg.only_high = data.get("only_high", config.only_high)
+        speed = data.get("speed", config.speed)
+        cfg.apply_speed(max(100, min(5000, int(speed))))
+
+        try:
+            loop = _asyncio.new_event_loop()
+            engine = ReconEngine(config=cfg, console=SilentConsole())
+            result = loop.run_until_complete(engine.run(target))
+            loop.close()
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+        import json as _json
+        from dataclasses import asdict as _asdict
+        result_dict = _json.loads(_json.dumps(_asdict(result), default=str))
+
+        if cfg.only_high:
+            result_dict["findings"] = [
+                f for f in result_dict.get("findings", [])
+                if f.get("severity") in {"HIGH", "CRITICAL"}
+            ]
+
+        return jsonify(result_dict)
+
+    @app.route("/diff", methods=["POST"])
+    def diff():
+        data = request.get_json(force=True) or {}
+        try:
+            result_a_dict = data["scan_a"]
+            result_b_dict = data["scan_b"]
+        except KeyError:
+            return jsonify({"error": "scan_a and scan_b are required"}), 400
+
+        def _dict_to_result(d):
+            r = ReconResult(target=d.get("target", ""))
+            for k, v in d.items():
+                if hasattr(r, k):
+                    setattr(r, k, v)
+            return r
+
+        result_a = _dict_to_result(result_a_dict)
+        result_b = _dict_to_result(result_b_dict)
+        diff_md = ReportGenerator.generate_diff(result_a, result_b)
+        return jsonify({"diff_markdown": diff_md})
+
+    print(f"[Argos API] Starting on http://{host}:{port}")
+    print(f"  POST /scan        — run a scan (body: {{target, speed, only_high}})")
+    print(f"  POST /diff        — diff two scans (body: {{scan_a, scan_b}})")
+    print(f"  GET  /health      — health check")
+    app.run(host=host, port=port, debug=False)
 
 
 def main() -> None:
@@ -3460,6 +4122,21 @@ Usage Examples:
                         help="Capture screenshot with Playwright (requires: pip install playwright && playwright install chromium)")
     parser.add_argument("--h1-user", dest="hackerone_username", default=None,
                         help="HackerOne username for X-Hackerone header (required by some programs like Dyson)")
+    # NEW FLAGS
+    parser.add_argument("--markdown", action="store_true",
+                        help="Save Markdown report (.md)")
+    parser.add_argument("--only-high", dest="only_high", action="store_true",
+                        help="Show and save only HIGH and CRITICAL severity findings")
+    parser.add_argument("--resume", dest="resume_file", nargs="?", const="",
+                        help="Resume an interrupted scan. Optionally provide a checkpoint file path.")
+    parser.add_argument("--diff", nargs=2, metavar=("SCAN_A.json", "SCAN_B.json"),
+                        help="Diff mode: compare two previous JSON scan reports")
+    parser.add_argument("--api", action="store_true",
+                        help="Start Flask REST API server instead of running a scan")
+    parser.add_argument("--api-host", dest="api_host", default="0.0.0.0",
+                        help="API server host (default: 0.0.0.0)")
+    parser.add_argument("--api-port", dest="api_port", type=int, default=5000,
+                        help="API server port (default: 5000)")
 
     args = parser.parse_args()
 
