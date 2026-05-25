@@ -27,6 +27,7 @@ import hashlib
 import uuid
 import ipaddress
 import signal
+import os
 from datetime import datetime, timedelta
 from collections import defaultdict
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -3463,6 +3464,8 @@ class ReconEngine:
     def _save_checkpoint(self, target: str, result: ReconResult, all_findings: List[Finding], step: str) -> None:
         try:
             path = self._resume_path(target, self.config.resume_file)
+            if ".." in str(path):
+                raise Exception("Invalid file path")
             data = {
                 "result": json.loads(json.dumps(asdict(result), default=str)),
                 "findings": json.loads(json.dumps([asdict(f) for f in all_findings], default=str)),
@@ -3477,6 +3480,8 @@ class ReconEngine:
     def _load_checkpoint(self, target: str) -> Optional[Tuple[ReconResult, List[Finding], str]]:
         try:
             path = self._resume_path(target, self.config.resume_file)
+            if ".." in str(path):
+                raise Exception("Invalid file path")
             if not path.exists():
                 return None
             with open(path, "r", encoding="utf-8") as f:
@@ -4086,11 +4091,19 @@ async def async_main(args: argparse.Namespace) -> None:
 
             if args.html:
                 html_path = output_dir / f"{domain}_{timestamp}_speed{speed}.html"
+                base_real = os.path.realpath(output_dir)
+                target_real = os.path.realpath(html_path)
+                if os.path.commonpath([base_real, target_real]) != base_real:
+                    raise Exception("Invalid file path")
                 html_path.write_text(ReportGenerator.generate_html(result), encoding="utf-8")
                 console.print(f"[green]HTML report saved: {html_path}[/green]")
 
             if getattr(args, 'markdown', False):
                 md_path = output_dir / f"{domain}_{timestamp}_speed{speed}.md"
+                base_real = os.path.realpath(output_dir)
+                target_real = os.path.realpath(md_path)
+                if os.path.commonpath([base_real, target_real]) != base_real:
+                    raise Exception("Invalid file path")
                 md_path.write_text(ReportGenerator.generate_markdown(result, only_high=config.only_high), encoding="utf-8")
                 console.print(f"[green]Markdown report saved: {md_path}[/green]")
 
