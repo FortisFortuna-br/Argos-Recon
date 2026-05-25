@@ -23,9 +23,11 @@ import sys
 import subprocess
 import shutil
 import difflib
-import pickle
 import hashlib
-from datetime import datetime
+import uuid
+import ipaddress
+import signal
+from datetime import datetime, timedelta
 from collections import defaultdict
 from urllib.parse import urljoin, urlparse, urlunparse
 from typing import Optional, Dict, List, Set, Any, Tuple, Callable
@@ -645,6 +647,80 @@ GITHUB_DORK_QUERIES = [
 ]
 
 # =============================================================================
+# SECURITY UTILITIES
+# =============================================================================
+
+class TimeoutRegex:
+    """ReDoS koruması — regex çalıştırmasını zaman sınırıyla güvence altına alır."""
+
+    def __init__(self, timeout: float = 1.0, max_input_bytes: int = 500_000):
+        self.timeout = timeout
+        self.max_input_bytes = max_input_bytes
+
+    def findall(self, pattern: str, string: str, flags: int = 0) -> List[Any]:
+        if len(string) > self.max_input_bytes:
+            logger.warning(f"Regex input too large ({len(string)} bytes), truncating to {self.max_input_bytes}")
+            string = string[:self.max_input_bytes]
+
+        result: List[Any] = []
+
+        def _run() -> None:
+            try:
+                result.extend(re.findall(pattern, string, flags))
+            except re.error as exc:
+                logger.warning(f"Regex error for pattern {pattern!r}: {exc}")
+
+        if hasattr(signal, "SIGALRM"):
+            # Unix: SIGALRM tabanlı timeout
+            def _handler(signum: int, frame: Any) -> None:
+                raise TimeoutError(f"Regex timeout ({self.timeout}s)")
+            old_handler = signal.signal(signal.SIGALRM, _handler)
+            signal.setitimer(signal.ITIMER_REAL, self.timeout)
+            try:
+                _run()
+            except TimeoutError as exc:
+                logger.warning(str(exc))
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+        else:
+            # Windows: thread tabanlı timeout
+            import threading
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=self.timeout)
+            if t.is_alive():
+                logger.warning(f"Regex timeout ({self.timeout}s) for pattern {pattern!r}")
+
+        return result
+
+
+_timeout_regex = TimeoutRegex(timeout=1.0)
+
+# =============================================================================
+# RATE LIMITER
+# =============================================================================
+
+class RateLimiter:
+    """GitHub API ve benzeri harici API'ler için token bucket rate limiter."""
+
+    def __init__(self, requests_per_minute: int = 30):
+        self.rpm = requests_per_minute
+        self._timestamps: List[datetime] = []
+
+    async def wait(self) -> None:
+        now = datetime.now()
+        cutoff = now - timedelta(minutes=1)
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+        if len(self._timestamps) >= self.rpm:
+            sleep_secs = 60.0 - (now - self._timestamps[0]).total_seconds()
+            if sleep_secs > 0:
+                logger.info(f"Rate limit reached, sleeping {sleep_secs:.1f}s")
+                await asyncio.sleep(sleep_secs)
+        self._timestamps.append(datetime.now())
+
+
+# =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
@@ -674,6 +750,30 @@ def normalize_crawl_url(base_url: str, href: str) -> Optional[str]:
 def get_domain(url: str) -> str:
     parsed = urlparse(url)
     return parsed.netloc.split(":")[0]
+
+
+def is_safe_url(url: str, allowed_schemes: Tuple[str, ...] = ("http", "https")) -> bool:
+    """SSRF koruması — private/loopback IP'leri ve tehlikeli scheme'leri engelle."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in allowed_schemes:
+            logger.warning(f"SSRF block: invalid scheme {parsed.scheme!r} in {url!r}")
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local or ip.is_multicast:
+                logger.warning(f"SSRF block: private/reserved IP {ip} in {url!r}")
+                return False
+        except ValueError:
+            # Hostname, IP değil — domain adı, geçerli kabul et
+            pass
+        return True
+    except Exception as e:
+        logger.warning(f"SSRF URL validation error for {url!r}: {e}")
+        return False
 
 
 def get_random_ua(config: Config) -> str:
@@ -791,6 +891,11 @@ class AsyncHTTPClient:
         headers: Optional[Dict[str, str]] = None,
         allow_redirects: bool = True
     ) -> Optional[httpx.Response]:
+        # SSRF koruması — harici URL'leri validate et
+        if not is_safe_url(url):
+            logger.warning(f"SSRF protection: blocked request to {url!r}")
+            return None
+
         merged_headers = self._build_headers(headers)
 
         async with self.semaphore:
@@ -2099,8 +2204,8 @@ class GitHubDorker:
                     ))
                     seen_repos.add(repo_full_name)
 
-                # Rate limiting için bekle
-                await asyncio.sleep(2.0 if not token else 0.5)
+                # Rate limiting için bekle (token bucket — burst'leri önler)
+                await asyncio.sleep(2.0 if not token else 0.5)  # ek güvenlik tamponu
 
             except json.JSONDecodeError:
                 pass
@@ -2388,9 +2493,23 @@ class NucleiScanner:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_output = output_dir / f"nuclei_{timestamp}.json"
 
+        # Input validation — sadece güvenli karakter setine izin ver
+        import shlex as _shlex
+        _allowed_severity = {"info", "low", "medium", "high", "critical"}
+        for part in severity_filter.split(","):
+            if part.strip().lower() not in _allowed_severity:
+                logger.warning(f"Invalid severity value blocked: {part!r}")
+                return [], []
+
+        # nuclei_path whitelist: yalnızca sistem PATH'inden gelen binary'e izin ver
+        resolved_nuclei = shutil.which(nuclei_path)
+        if not resolved_nuclei:
+            logger.warning(f"Nuclei binary not found in PATH: {nuclei_path!r}")
+            return [], []
+
         cmd = [
-            nuclei_path,
-            "-u", target,
+            resolved_nuclei,
+            "-u", target,           # subprocess list form — shell injection riski yok
             "-severity", severity_filter,
             "-json-export", str(json_output),
             "-silent",
@@ -2411,7 +2530,8 @@ class NucleiScanner:
                         capture_output=True,
                         text=True,
                         timeout=timeout_seconds,
-                        cwd=str(output_dir)
+                        cwd=str(output_dir),
+                        shell=False,   # CRITICAL: shell injection prevention
                     )
                     return proc.returncode, proc.stdout, proc.stderr
                 except subprocess.TimeoutExpired:
@@ -2635,9 +2755,17 @@ class ScreenshotCapture:
             from playwright.async_api import async_playwright
 
             output_dir.mkdir(parents=True, exist_ok=True)
-            domain = get_domain(url).replace(".", "_")
+
+            # UUID kullan — domain adından üretilmesin (injection riski önlenir)
+            screenshot_id = uuid.uuid4().hex[:12]
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            screenshot_path = output_dir / f"screenshot_{domain}_{timestamp}.png"
+            screenshot_path = output_dir / f"screenshot_{screenshot_id}_{timestamp}.png"
+
+            # Path traversal son kontrolü
+            screenshot_path = screenshot_path.resolve()
+            if not str(screenshot_path).startswith(str(output_dir.resolve())):
+                logger.error("Path traversal detected in screenshot path, aborting")
+                return None
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
@@ -3324,13 +3452,18 @@ class ReconEngine:
         if resume_file:
             return Path(resume_file)
         h = hashlib.md5(target.encode()).hexdigest()[:8]
-        return Path(f".argos_resume_{h}.pkl")
+        return Path(f".argos_resume_{h}.json")
 
     def _save_checkpoint(self, target: str, result: ReconResult, all_findings: List[Finding], step: str) -> None:
         try:
             path = self._resume_path(target, self.config.resume_file)
-            with open(path, "wb") as f:
-                pickle.dump({"result": result, "findings": all_findings, "step": step}, f)
+            data = {
+                "result": json.loads(json.dumps(asdict(result), default=str)),
+                "findings": json.loads(json.dumps([asdict(f) for f in all_findings], default=str)),
+                "step": step,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
             logger.debug(f"Checkpoint saved at step '{step}' → {path}")
         except Exception as e:
             logger.warning(f"Failed to save checkpoint: {e}")
@@ -3340,10 +3473,25 @@ class ReconEngine:
             path = self._resume_path(target, self.config.resume_file)
             if not path.exists():
                 return None
-            with open(path, "rb") as f:
-                data = pickle.load(f)
-            return data["result"], data["findings"], data["step"]
-        except Exception as e:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Reconstruct ReconResult from dict
+            result_dict = data.get("result", {})
+            result = ReconResult(target=result_dict.get("target", ""))
+            for k, v in result_dict.items():
+                if hasattr(result, k):
+                    setattr(result, k, v)
+            # Reconstruct findings from dicts
+            findings_raw = data.get("findings", [])
+            findings = []
+            for fd in findings_raw:
+                try:
+                    findings.append(Finding(**{k: v for k, v in fd.items() if k in Finding.__dataclass_fields__}))
+                except Exception:
+                    pass
+            step = data.get("step", "")
+            return result, findings, step
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.warning(f"Failed to load checkpoint: {e}")
             return None
 
@@ -3956,6 +4104,24 @@ async def async_main(args: argparse.Namespace) -> None:
     console.print("\n[bold green]✓ Scan complete![/bold green]")
 
 
+def _validate_report_path(file_path: str, base_dir: Path = Path("./reports")) -> Path:
+    """Dosya yolunu validate et — yalnızca base_dir içindeki .json dosyalarına izin ver."""
+    try:
+        abs_path = Path(file_path).resolve()
+        abs_base = base_dir.resolve()
+        if not str(abs_path).startswith(str(abs_base) + "/") and abs_path != abs_base:
+            raise ValueError(f"Path traversal detected: {file_path!r} is outside {abs_base}")
+        if abs_path.suffix.lower() != ".json":
+            raise ValueError(f"Only .json files are allowed, got: {abs_path.suffix!r}")
+        if not abs_path.exists():
+            raise FileNotFoundError(f"Report file not found: {file_path!r}")
+        return abs_path
+    except (ValueError, FileNotFoundError):
+        raise
+    except Exception as e:
+        raise ValueError(f"Invalid report path: {e}") from e
+
+
 async def _run_diff_mode(
     args: argparse.Namespace,
     config: 'Config',
@@ -3968,8 +4134,11 @@ async def _run_diff_mode(
         console.print("[red]--diff requires exactly 2 JSON report paths[/red]")
         return
     try:
-        data_a = json.loads(Path(diff_files[0]).read_text())
-        data_b = json.loads(Path(diff_files[1]).read_text())
+        output_dir = Path(getattr(args, 'output', './reports'))
+        path_a = _validate_report_path(diff_files[0], base_dir=output_dir)
+        path_b = _validate_report_path(diff_files[1], base_dir=output_dir)
+        data_a = json.loads(path_a.read_text(encoding="utf-8"))
+        data_b = json.loads(path_b.read_text(encoding="utf-8"))
     except Exception as e:
         console.print(f"[red]Failed to load diff reports: {e}[/red]")
         return
