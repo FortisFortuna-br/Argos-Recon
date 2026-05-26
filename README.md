@@ -62,13 +62,12 @@ pip install -r requirements.txt
 
 ### requirements.txt
 ```
-httpx[http2]>=0.25.0
+httpx[http2]>=0.27.0
 beautifulsoup4>=4.12.0
 rich>=13.0.0
 aiodns>=3.0.0
-lxml==6.1.0
+lxml>=4.9.0
 packaging>=23.0
-h11==0.16.0
 ```
 
 ### Optional (for extra features)
