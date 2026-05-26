@@ -754,7 +754,25 @@ def get_domain(url: str) -> str:
 
 
 def is_safe_url(url: str, allowed_schemes: Tuple[str, ...] = ("http", "https")) -> bool:
-    """SSRF koruması — private/loopback IP'leri ve tehlikeli scheme'leri engelle."""
+    """SSRF koruması — private/loopback IP'leri, tehlikeli scheme'leri ve
+    bilinen metadata hostname'lerini engelle. DNS çözümlemesi ile de kontrol eder."""
+
+    # Tehlikeli hostname pattern'leri (cloud metadata, localhost varyantları)
+    _BLOCKED_HOSTNAME_PATTERNS = re.compile(
+        r"(^localhost$"
+        r"|^metadata\.google\.internal$"
+        r"|^169\.254\.169\.254$"
+        r"|^100\.100\.100\.200$"       # Alibaba Cloud metadata
+        r"|^192\.0\.2\."               # TEST-NET-1
+        r"|^198\.51\.100\."            # TEST-NET-2
+        r"|^203\.0\.113\."             # TEST-NET-3
+        r"|\.internal$"
+        r"|\.local$"
+        r"|\blocal\b"
+        r")",
+        re.IGNORECASE,
+    )
+
     try:
         parsed = urlparse(url)
         if parsed.scheme not in allowed_schemes:
@@ -763,14 +781,33 @@ def is_safe_url(url: str, allowed_schemes: Tuple[str, ...] = ("http", "https")) 
         hostname = parsed.hostname
         if not hostname:
             return False
+
+        # Literal IP kontrolü
         try:
             ip = ipaddress.ip_address(hostname)
             if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local or ip.is_multicast:
                 logger.warning(f"SSRF block: private/reserved IP {ip} in {url!r}")
                 return False
         except ValueError:
-            # Hostname, IP değil — domain adı, geçerli kabul et
-            pass
+            # Hostname domain adı — bilinen tehlikeli pattern'leri kontrol et
+            if _BLOCKED_HOSTNAME_PATTERNS.search(hostname):
+                logger.warning(f"SSRF block: blocked hostname pattern {hostname!r} in {url!r}")
+                return False
+
+            # DNS çözümlemesi yaparak resolve edilen IP'yi de kontrol et
+            try:
+                resolved_ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+                if (resolved_ip.is_private or resolved_ip.is_loopback
+                        or resolved_ip.is_reserved or resolved_ip.is_link_local
+                        or resolved_ip.is_multicast):
+                    logger.warning(
+                        f"SSRF block: {hostname!r} resolves to private IP {resolved_ip} in {url!r}"
+                    )
+                    return False
+            except (socket.gaierror, OSError):
+                # DNS çözümlenemedi — block etme, sadece devam et
+                pass
+
         return True
     except Exception as e:
         logger.warning(f"SSRF URL validation error for {url!r}: {e}")
@@ -2547,7 +2584,7 @@ class NucleiScanner:
             if returncode == -2:
                 return [], []
 
-            if returncode not in [0, -1] and returncode != 0:
+            if returncode not in (0, -1):
                 logger.warning(f"Nuclei exited with code {returncode}: {stderr[:200]}")
 
             # JSON output dosyasını oku
@@ -3312,7 +3349,7 @@ class ReportGenerator:
     <h2>🔓 Open Ports</h2>
     <div class="section">{', '.join([str(p) for p in result.open_ports]) if result.open_ports else 'No open ports detected'}</div>
 
-    {f'<div style="background:#fff3cd;padding:10px;border-radius:5px;margin-top:20px;"><h3>⚠️ Errors</h3><ul>{"".join([f"<li>{e}</li>" for e in result.errors])}</ul></div>' if result.errors else ''}
+    {f'<div style="background:#fff3cd;padding:10px;border-radius:5px;margin-top:20px;"><h3>⚠️ Errors</h3><ul>{"".join([f"<li>{_e(e)}</li>" for e in result.errors])}</ul></div>' if result.errors else ''}
 </div>
 </body>
 </html>"""
@@ -3521,16 +3558,17 @@ class ReconEngine:
         url = normalize_url(target)
         domain = get_domain(url)
 
-        # --- Resume: always check for an existing checkpoint ---
+        # --- Resume: yalnızca --resume flag'i açıkça verilmişse checkpoint yükle ---
         resumed_result: Optional[ReconResult] = None
         resumed_findings: List[Finding] = []
         resume_from_step: str = ""
-        checkpoint = self._load_checkpoint(url)
-        if checkpoint:
-            resumed_result, resumed_findings, resume_from_step = checkpoint
-            self.console.print(
-                f"[bold yellow]⏩ Resuming from checkpoint (last completed: '{resume_from_step}')[/bold yellow]"
-            )
+        if self.config.resume_file is not None:
+            checkpoint = self._load_checkpoint(url)
+            if checkpoint:
+                resumed_result, resumed_findings, resume_from_step = checkpoint
+                self.console.print(
+                    f"[bold yellow]⏩ Resuming from checkpoint (last completed: '{resume_from_step}')[/bold yellow]"
+                )
 
         result = resumed_result if resumed_result else ReconResult(target=url, speed_used=self.config.speed)
         all_findings: List[Finding] = resumed_findings if resumed_findings else []
@@ -4124,11 +4162,18 @@ async def async_main(args: argparse.Namespace) -> None:
 
 
 def _validate_report_path(file_path: str, base_dir: Path = Path("./reports")) -> Path:
-    """Dosya yolunu validate et — yalnızca base_dir içindeki .json dosyalarına izin ver."""
+    """Dosya yolunu validate et — yalnızca base_dir içindeki .json dosyalarına izin ver.
+    Windows ve Unix'te çalışır (os.path.commonpath kullanır, hardcoded '/' yok)."""
     try:
         abs_path = Path(file_path).resolve()
         abs_base = base_dir.resolve()
-        if not str(abs_path).startswith(str(abs_base) + "/") and abs_path != abs_base:
+        # os.path.commonpath hem Windows hem Unix'te çalışır
+        try:
+            common = Path(os.path.commonpath([str(abs_path), str(abs_base)]))
+        except ValueError:
+            # Windows'ta farklı sürücüler (C:\ vs D:\) için ValueError fırlatılır
+            raise ValueError(f"Path traversal detected: {file_path!r} is outside {abs_base}")
+        if common != abs_base:
             raise ValueError(f"Path traversal detected: {file_path!r} is outside {abs_base}")
         if abs_path.suffix.lower() != ".json":
             raise ValueError(f"Only .json files are allowed, got: {abs_path.suffix!r}")
@@ -4184,13 +4229,28 @@ async def _run_diff_mode(
         console.print(diff_md)
 
 
-def _run_api_server(config: 'Config', host: str = "0.0.0.0", port: int = 5000) -> None:
+def _run_api_server(config: 'Config', host: str = "127.0.0.1", port: int = 5000) -> None:
     """Start a minimal Flask REST API server."""
     try:
         from flask import Flask, request, jsonify
     except ImportError:
         print("Flask not installed. Install with: pip install flask")
         sys.exit(1)
+
+    # API key authentication — ARGOS_API_KEY env değişkeni ile ayarlanır
+    _api_key = os.environ.get("ARGOS_API_KEY", "").strip()
+    if not _api_key:
+        print("[Argos API] WARNING: ARGOS_API_KEY env variable not set. "
+              "API is UNAUTHENTICATED — bind to localhost only or set a key.")
+
+    def _require_api_key() -> Optional[Any]:
+        """API key kontrolü. Key tanımlıysa tüm endpoint'lerde zorunludur."""
+        if not _api_key:
+            return None  # Key yoksa kontrolü atla (uyarı yukarıda verildi)
+        provided = request.headers.get("X-API-Key", "").strip()
+        if not provided or provided != _api_key:
+            return jsonify({"error": "Unauthorized: missing or invalid X-API-Key header"}), 401
+        return None
 
     app = Flask("argos-api")
 
@@ -4200,6 +4260,9 @@ def _run_api_server(config: 'Config', host: str = "0.0.0.0", port: int = 5000) -
 
     @app.route("/scan", methods=["POST"])
     def scan():
+        auth_error = _require_api_key()
+        if auth_error:
+            return auth_error
         import asyncio as _asyncio
         data = request.get_json(force=True) or {}
         target = data.get("target", "")
@@ -4234,6 +4297,9 @@ def _run_api_server(config: 'Config', host: str = "0.0.0.0", port: int = 5000) -
 
     @app.route("/diff", methods=["POST"])
     def diff():
+        auth_error = _require_api_key()
+        if auth_error:
+            return auth_error
         data = request.get_json(force=True) or {}
         try:
             result_a_dict = data["scan_a"]
@@ -4321,8 +4387,8 @@ Usage Examples:
                         help="Diff mode: compare two previous JSON scan reports")
     parser.add_argument("--api", action="store_true",
                         help="Start Flask REST API server instead of running a scan")
-    parser.add_argument("--api-host", dest="api_host", default="0.0.0.0",
-                        help="API server host (default: 0.0.0.0)")
+    parser.add_argument("--api-host", dest="api_host", default="127.0.0.1",
+                        help="API server host (default: 127.0.0.1)")
     parser.add_argument("--api-port", dest="api_port", type=int, default=5000,
                         help="API server port (default: 5000)")
 
@@ -4351,3 +4417,4 @@ Usage Examples:
 
 if __name__ == "__main__":
     main()
+    
