@@ -21,7 +21,7 @@ So I'm building the full web platform.
 
 | Tier | Scans/day | Formats | Priority |
 |------|-----------|---------|----------|
-| Free | 1 | JSON | Standard queue |
+| Free | 3 | JSON | Standard queue |
 | Pro ($20/mo) | 10 | JSON + HTML | High priority |
 | Enterprise ($50/mo) | Unlimited | JSON + HTML + PDF | Top priority + API key |
 
